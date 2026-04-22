@@ -9,7 +9,9 @@ Usage:
 What this script does:
 - copies the raw latexdiff TeX into a separate review TeX
 - injects a popup-annotation macro block before \\begin{document}
-- inserts one empty popup macro after each DIF add/delete block
+- inserts one empty popup macro after each safe DIF add/delete block
+- skips structural diff blocks such as \\item / \\begin / \\end that are unsafe
+  for direct popup insertion
 - assigns stable sequential IDs such as R001-D and R002-A
 - writes a JSON skeleton keyed by those IDs
 
@@ -68,6 +70,13 @@ BLOCK_RE = re.compile(
     re.DOTALL | re.VERBOSE,
 )
 
+UNSAFE_TOKENS = (
+    r"\begin",
+    r"\end",
+    r"\item",
+    r"\bibitem",
+)
+
 
 @dataclass
 class DiffBlock:
@@ -76,6 +85,10 @@ class DiffBlock:
     placeholder: str
     line: int
     block: str
+
+
+def is_safe_popup_target(block: str) -> bool:
+    return not any(token in block for token in UNSAFE_TOKENS)
 
 
 def parse_args() -> argparse.Namespace:
@@ -136,24 +149,29 @@ def split_document(tex: str) -> tuple[str, str]:
     return head + sep, tail
 
 
-def insert_placeholders(body: str, prefix: str, line_offset: int) -> tuple[str, list[DiffBlock]]:
+def insert_placeholders(body: str, prefix: str, line_offset: int) -> tuple[str, list[DiffBlock], list[int]]:
     out: list[str] = []
     blocks: list[DiffBlock] = []
+    skipped_lines: list[int] = []
     cursor = 0
     index = 0
 
     for match in BLOCK_RE.finditer(body):
-        index += 1
         block = match.group("block")
         kind = match.group("kind_fl") or match.group("kind_std")
+        line = line_offset + body.count("\n", 0, match.start())
+        out.append(body[cursor : match.end()])
+        cursor = match.end()
+
+        if not is_safe_popup_target(block):
+            skipped_lines.append(line)
+            continue
+
+        index += 1
         diff_id = build_id(prefix, index, kind)
         placeholder = placeholder_for(diff_id)
-        line = line_offset + body.count("\n", 0, match.start())
         macro = f"\n\\DiffPopup{{{diff_id}}}{{{placeholder}}}"
-
-        out.append(body[cursor : match.end()])
         out.append(macro)
-        cursor = match.end()
         blocks.append(
             DiffBlock(
                 id=diff_id,
@@ -165,7 +183,7 @@ def insert_placeholders(body: str, prefix: str, line_offset: int) -> tuple[str, 
         )
 
     out.append(body[cursor:])
-    return "".join(out), blocks
+    return "".join(out), blocks, skipped_lines
 
 
 def write_comments_json(path: Path, blocks: list[DiffBlock]) -> None:
@@ -187,7 +205,7 @@ def main() -> int:
     tex = inject_macro_block(tex)
     head, body = split_document(tex)
     line_offset = head.count("\n") + 1
-    prepared_body, blocks = insert_placeholders(body, args.prefix, line_offset)
+    prepared_body, blocks, skipped_lines = insert_placeholders(body, args.prefix, line_offset)
     prepared_tex = head + prepared_body
 
     output_tex.write_text(prepared_tex, encoding="utf-8")
@@ -196,6 +214,10 @@ def main() -> int:
     print(f"prepared_tex: {output_tex}")
     print(f"comments_json: {comments_json}")
     print(f"diff_blocks: {len(blocks)}")
+    print(f"skipped_structural_blocks: {len(skipped_lines)}")
+    if skipped_lines:
+        preview = ", ".join(str(line) for line in skipped_lines[:20])
+        print(f"skipped_lines: {preview}")
     for block in blocks[:20]:
         print(f"{block.id}\t{block.kind}\tline={block.line}")
     if len(blocks) > 20:
