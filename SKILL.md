@@ -34,6 +34,7 @@ Do not start from a hand-picked or ad hoc diff source when the standard `latexdi
 
 ## Core Rules
 
+- In repositories that use document rotation, treat `document/previous/` and commit-stamped snapshot directories as read-only unless the user explicitly asks to modify archived artifacts there.
 - Treat `\DIFdel...` and `\DIFadd...` as separate comment targets.
 - Treat `FL` variants (`\DIFdelbeginFL...\DIFdelendFL`, `\DIFaddbeginFL...\DIFaddendFL`) as comment targets too.
 - Use stable sequential IDs rather than line numbers as the primary key.
@@ -65,6 +66,8 @@ Do not start from a hand-picked or ad hoc diff source when the standard `latexdi
 
 1. Run `latexdiff` first and confirm the raw diff `.tex` path that it produced.
 2. Choose a separate output path for the review copy.
+   By default, use a fresh non-rotated output directory under the active `document/` root.
+   Do not place the review copy in `document/previous/` or any rotated snapshot directory unless the user explicitly asks for that location.
 3. Run `scripts/prepare_popup_review.py` to copy the raw diff, inject the popup macro block, and insert placeholder popup macros after every diff chunk.
 4. Choose the review criteria for this diff by loading only the relevant parts of `../paper-review/references/criteria.md`.
 5. Obtain the corresponding source diff for the same change set, using `git diff` by default unless another review surface is clearly better for the task.
