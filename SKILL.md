@@ -1,85 +1,57 @@
 ---
 name: latexdiff-popup-review
-description: Use when the user wants to turn a latexdiff-generated LaTeX diff into a popup-comment review copy, with a substantive review pass derived from `paper-review` style findings and separate popup comments for DIF delete/add blocks, placeholder injection, comment-file filling, and Acrobat-oriented annotations.
+description: Git 管理された LaTeX project から補助スクリプトで生 `latexdiff` diff を生成し、`paper-review` 基準の所見を Adobe Acrobat / Reader 向け popup 注釈付きレビュー PDF に変換するときに使う。DIF add/delete 対象へのコメント JSON 作成と PDF 注釈生成を扱う。
 ---
 
 # Latexdiff Popup Review
 
-## Overview
+## 目的
 
-This skill handles the post-`latexdiff` review stage. It assumes a raw latexdiff `.tex` already exists and produces a separate review `.tex` / `.pdf` with popup comments attached to each diff chunk.
+Git 管理された LaTeX project から生 `latexdiff` TeX を生成し、popup 注釈付きレビュー PDF を作る。ワークフローの主導は `scripts/popup_review_wizard.py` に任せ、Codex が直接書くのは script が指示する ID 付きコメント JSON だけである。
 
-Keep `latexdiff` generation itself separate. Always use `latexdiff` first to generate the raw diff artifact before using this skill.
+## 参照
 
-The current design is batch-oriented:
+- 手順、責務、データの流れ、具体例は [references/popup-review-pipeline.md](references/popup-review-pipeline.md) を読む。
+- 実体的レビューの評価基準は [../paper-review/references/criteria.md](../paper-review/references/criteria.md) の必要箇所だけを読む。
+- script の入出力契約を変える前に、対象 script の docstring を読む。
 
-1. A preparation script copies the raw diff `.tex`, injects popup macros, and inserts empty comment placeholders after each diff chunk.
-2. Codex performs a substantive review pass in the style of `paper-review` `review-only`, using a source diff such as `git diff` and splitting findings by semantic change rather than by popup target.
-3. Codex reads the prepared review `.tex` as a whole and renders those findings into a separate comment file keyed by stable IDs.
-4. A fill script writes the comments back into the placeholder macros by string replacement.
+## 中核規則
 
-Do not edit the raw latexdiff artifact in place.
-Codex must not directly rewrite the prepared review `.tex` either. In this workflow, the only file Codex may write directly is the separate comment file.
+- **script 主導**: 出力 directory、master TeX、比較元 commit、比較先 commit がある場合は、まず `scripts/popup_review_wizard.py` を起動し、その後は script の標準出力の指示に従う。
+- **入力面の固定**: Git 管理された LaTeX project から補助スクリプトで生 diff を生成し、既存 diff を入口にしない。
+- **レビュー粒度の分離**: 実体的レビューは意味単位で行い、popup コメントは diff 対象単位に割り当てる。
+- **成果物境界の維持**: 生 diff、review TeX、コメント JSON、popup PDF の責務を混ぜない。
+- **レビュー記録の一元化**: Popup 注釈付き PDF を既定のレビュー記録にする。
 
-## When To Use
+## コメント契約
 
-- The user already has a `latexdiff` `.tex` and wants popup comments added.
-- The review should target Adobe Acrobat / Reader rather than visible margin comments.
-- Each `delete` and `add` should receive separate comments.
-- The workflow should preserve a raw diff artifact and create a separate derived review copy.
-- The review stage should work the same way whether the original edit was made by Codex or by someone else.
+- レビュー対象の diff に空コメントを残さない。ラベル、補完コメント、例外判断は [references/popup-review-pipeline.md](references/popup-review-pipeline.md) の **Comments JSON 契約** に従う。
 
-Do not use this skill when the user only wants a plain latexdiff PDF with no popup review layer.
-Do not start from a hand-picked or ad hoc diff source when the standard `latexdiff` skill should be used first to generate the raw diff artifact.
+## 実行契約
 
-## Core Rules
+- 詳細な手順は [references/popup-review-pipeline.md](references/popup-review-pipeline.md) に従う。
+- 出力 directory、master TeX、比較元 commit、比較先 commit が与えられたら、次の形で script を起動する。
 
-- In repositories that use document rotation, treat `document/previous/` and commit-stamped snapshot directories as read-only unless the user explicitly asks to modify archived artifacts there.
-- Treat `\DIFdel...` and `\DIFadd...` as separate comment targets.
-- Treat `FL` variants (`\DIFdelbeginFL...\DIFdelendFL`, `\DIFaddbeginFL...\DIFaddendFL`) as comment targets too.
-- Use stable sequential IDs rather than line numbers as the primary key.
-- Delete comments should describe the role of the old wording and evaluate whether deleting it is appropriate.
-- Add comments should describe the effect of the new wording and evaluate whether adding it is appropriate.
-- Each comment should include a meaning-change label near the start so readers can quickly see whether the diff preserves meaning. Use labels such as `[意味維持]`, `[意味変化あり]`, and `[意味変化要確認]`.
-- Prefer explicit review labels such as `[OK]`, `[要確認]`, and `[懸念]` at the start of each comment when that helps separate endorsement from mere description.
-- Do not treat every add/delete pair as automatically justified. Review comments must remain willing to question, defer, or criticize a change instead of rationalizing it.
-- Use the same substantive review standards as `paper-review`.
-- Perform the substantive review pass in the style of `paper-review` `review-only` before rendering popup comments.
-- Use a source diff such as `git diff` as the default review surface for that substantive pass; use the latexdiff artifact for popup target mapping and placement.
-- Keep review findings at the level of semantic change units rather than popup targets. Do not make `paper-review` reason in terms of add/delete blocks.
-- One semantic finding may map to multiple popup IDs, and one diff hunk may yield multiple findings when it contains separable changes.
-- When the substantive review pass produces no finding for a reviewed change, generate the popup comment locally from the diff target and its nearby context. In that fallback path, default to a concise `[OK]` explanation unless the popup-stage reading itself reveals a concern.
-- Load only the relevant parts of `../paper-review/references/criteria.md` when judging the diff. `latexdiff-popup-review` changes the review surface and output format, not the underlying review criteria.
-- Comment language should follow the user or project preference.
-- Always obtain the raw diff artifact through the `latexdiff` skill first.
-- Codex should read the prepared review `.tex` as a whole.
-- Codex must write only the separate comment file. It must not directly modify the raw diff `.tex` or the prepared review `.tex`.
-- Treat this workflow as a fresh review pass even when the original edit was also produced by Codex.
-- Do not leave a reviewed diff target without a comment. Even when a diff looks inappropriate, put some comment text in the comment file for that target.
-- Treat the popup-reviewed PDF itself as the default review record. Do not create an extra Markdown note by default.
-- The intermediate `paper-review` style findings may remain transient. Do not create a separate review Markdown note unless the user explicitly asks for one or a separate summary is otherwise necessary.
-- Only create a separate Markdown or other follow-up document when the user explicitly asks for it, or when inappropriate diffs need a separate summary after the per-target comments are complete.
-- The fill stage should use plain string replacement keyed by ID.
-- The fill stage should encode popup text as UTF-16BE hex before embedding it into the PDF annotation `/Contents` field.
+```bash
+python3 /path/to/latexdiff-popup-review/scripts/popup_review_wizard.py --output-dir OUT --master-tex MAIN.tex --from-commit OLD --to-commit NEW
+```
 
-## Workflow
+- script が `popup_comments.json` の completion を待機したら、`popup_comments.json` だけを編集し、同じ process に戻る。
+- process が終了した場合は、同じ command に `--resume-comments` を付けて再実行し、既存 `popup_comments.json` を検証・保持して続行する。
+- baseline revision、target revision、master TeX、出力先が不明な場合は質問し、推測で確定しない。
 
-1. Run `latexdiff` first and confirm the raw diff `.tex` path that it produced.
-2. Choose a separate output path for the review copy.
-   By default, use a fresh non-rotated output directory under the active `document/` root.
-   Do not place the review copy in `document/previous/` or any rotated snapshot directory unless the user explicitly asks for that location.
-3. Run `scripts/prepare_popup_review.py` to copy the raw diff, inject the popup macro block, and insert placeholder popup macros after every diff chunk.
-4. Choose the review criteria for this diff by loading only the relevant parts of `../paper-review/references/criteria.md`.
-5. Obtain the corresponding source diff for the same change set, using `git diff` by default unless another review surface is clearly better for the task.
-6. Run a substantive review pass in the style of `paper-review` `review-only`, splitting the diff into semantic findings rather than popup targets.
-7. Read the prepared review `.tex` as a whole and map those findings onto the relevant popup IDs. If a reviewed change has no substantive finding, synthesize a short fallback popup comment from the local old/new wording and nearby context.
-8. Write comments only to a separate JSON file keyed by diff ID, ensure every reviewed target receives some comment text, and include a meaning-change label for each diff.
-9. Treat the filled popup-review PDF as the default deliverable. Do not add a separate Markdown note unless the user explicitly asks for one or some inappropriate diffs need a separate summary.
-10. Run `scripts/fill_popup_comments.py` to fill the placeholders by string replacement.
-11. Compile the derived review `.tex` only after the fill step.
+## 補助スクリプト
 
-## References
+現在の入出力は各 script の docstring を読む。対象 script:
 
-- For the current pipeline and expected data flow, read [references/popup-review-pipeline.md](references/popup-review-pipeline.md).
-- For substantive review criteria, load only the relevant parts of [../paper-review/references/criteria.md](../paper-review/references/criteria.md).
-- Read the script docstrings before changing their I/O contract.
+- `scripts/popup_review_wizard.py`
+- `scripts/prepare_popup_review.py`
+- `scripts/fill_popup_comments.py`
+
+script 主導実行は `scripts/popup_review_wizard.py` を使う。注意事項は [references/popup-review-pipeline.md](references/popup-review-pipeline.md) の **処理フロー** を参照する。
+
+## 出力契約
+
+- **既定の成果物**: popup 注釈付き PDF。
+- **任意の note**: ユーザーが明示的に求めた場合、または問題のある diff の別要約が有用な場合だけ Markdown note を作る。
+- **検証報告**: build command の結果、生成 PDF path、コメントの充足状況、skip した構造的 diff、主要な注意事項を含める。

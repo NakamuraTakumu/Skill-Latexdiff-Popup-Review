@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""Prepare a latexdiff review copy with popup placeholders.
+"""popup placeholders 付きの latexdiff review copy を準備する。
 
-Usage:
+使用法:
   python3 prepare_popup_review.py INPUT.tex
   python3 prepare_popup_review.py INPUT.tex -o OUTPUT.tex
   python3 prepare_popup_review.py INPUT.tex --comments-json COMMENTS.json
 
-What this script does:
-- copies the raw latexdiff TeX into a separate review TeX
-- injects a popup-annotation macro block before \\begin{document}
-- inserts one empty popup macro after each safe DIF add/delete block
-- skips structural diff blocks such as \\item / \\begin / \\end that are unsafe
-  for direct popup insertion
-- assigns stable sequential IDs such as R001-D and R002-A
-- writes a JSON skeleton keyed by those IDs
+この script の処理:
+- raw latexdiff TeX を別の review TeX に copy する
+- \\begin{document} の前に popup-annotation macro block を inject する
+- 各 safe DIF add/delete block の後に空の popup macro を 1 つ挿入する
+- direct popup insertion には unsafe な \\item / \\begin / \\end などの
+  structural diff blocks を skip する
+- R001-D や R002-A のような stable sequential IDs を assign する
+- それらの IDs keyed の JSON skeleton を write する
 
-Inputs:
+入力:
 - INPUT.tex: raw latexdiff artifact
 
-Outputs:
+出力:
 - OUTPUT.tex: prepared review copy
-- COMMENTS.json: empty JSON object with the detected IDs
+- COMMENTS.json: detected IDs を key、空文字列を value に持つ JSON object
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass
+from collections.abc import Mapping
 from pathlib import Path
 
 
@@ -41,7 +42,7 @@ MACRO_BLOCK = r"""
     \noindent
     \raise1.3\baselineskip
     \hbox to 0pt{\vsize=0pt
-      \pdfannot{
+      \pdfannot width 1em height 1em depth 0pt {
         /Subtype /Text
         /Open false
         /Name /Comment
@@ -77,6 +78,8 @@ UNSAFE_TOKENS = (
     r"\bibitem",
 )
 
+PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
 
 @dataclass
 class DiffBlock:
@@ -93,22 +96,32 @@ def is_safe_popup_target(block: str) -> bool:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("input_tex", type=Path, help="Raw latexdiff TeX file.")
+    p.add_argument("input_tex", type=Path, help="raw latexdiff TeX file。")
     p.add_argument(
         "-o",
         "--output-tex",
         type=Path,
-        help="Prepared review TeX path. Defaults to INPUT stem + _popup_review.tex.",
+        help="prepared review TeX path。default は INPUT stem + _popup_review.tex。",
     )
     p.add_argument(
         "--comments-json",
         type=Path,
-        help="JSON skeleton path. Defaults to OUTPUT stem + _comments.json.",
+        help="JSON skeleton path。default は OUTPUT stem + _comments.json。",
     )
     p.add_argument(
         "--prefix",
         default="R",
-        help="ID prefix. Default: R",
+        help="ID prefix。default: R",
+    )
+    p.add_argument(
+        "--overwrite-comments",
+        action="store_true",
+        help="既存 comments JSON を空 skeleton で置き換える。default は既存 file を拒否する。",
+    )
+    p.add_argument(
+        "--resume-comments",
+        action="store_true",
+        help="既存 comments JSON の key set と string values を検証して値を保持する。",
     )
     return p.parse_args()
 
@@ -119,6 +132,15 @@ def default_output_path(input_tex: Path) -> Path:
 
 def default_comments_path(output_tex: Path) -> Path:
     return output_tex.with_name(f"{output_tex.stem}_comments.json")
+
+
+def ensure_distinct_paths(*named_paths: tuple[str, Path]) -> None:
+    seen: dict[Path, str] = {}
+    for name, path in named_paths:
+        resolved = path.resolve()
+        if resolved in seen:
+            raise ValueError(f"{seen[resolved]} と {name} が同じ path です: {resolved}")
+        seen[resolved] = name
 
 
 def ensure_injectable(tex: str) -> None:
@@ -135,6 +157,11 @@ def inject_macro_block(tex: str) -> str:
 def build_id(prefix: str, index: int, kind: str) -> str:
     letter = "D" if kind == "del" else "A"
     return f"{prefix}{index:03d}-{letter}"
+
+
+def validate_prefix(prefix: str) -> None:
+    if not PREFIX_RE.fullmatch(prefix):
+        raise ValueError("prefix must match ^[A-Za-z][A-Za-z0-9_]*$")
 
 
 def placeholder_for(diff_id: str) -> str:
@@ -186,30 +213,88 @@ def insert_placeholders(body: str, prefix: str, line_offset: int) -> tuple[str, 
     return "".join(out), blocks, skipped_lines
 
 
-def write_comments_json(path: Path, blocks: list[DiffBlock]) -> None:
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def write_json_atomic(path: Path, payload: Mapping[str, str]) -> None:
+    write_text_atomic(path, json.dumps(dict(payload), ensure_ascii=False, indent=2) + "\n")
+
+
+def validate_comments_json(path: Path, blocks: list[DiffBlock]) -> dict[str, str]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("comments JSON must be an object")
+    expected = {block.id for block in blocks}
+    actual = set(payload)
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    if missing or extra:
+        details: list[str] = []
+        if missing:
+            details.append("missing: " + ", ".join(missing[:20]))
+        if extra:
+            details.append("extra: " + ", ".join(extra[:20]))
+        raise ValueError("comments JSON key set does not match prepared IDs; " + "; ".join(details))
+    out: dict[str, str] = {}
+    for key, value in payload.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("comments JSON must contain string keys and string values")
+        out[key] = value
+    return out
+
+
+def write_comments_json(path: Path, blocks: list[DiffBlock], overwrite: bool) -> None:
+    if path.exists() and not overwrite:
+        raise ValueError(
+            f"comments JSON already exists; refusing to overwrite: {path}. "
+            "--overwrite-comments を使うか別 path を指定してください。"
+        )
     payload = {block.id: "" for block in blocks}
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(path, payload)
 
 
 def main() -> int:
     args = parse_args()
+    if args.resume_comments and args.overwrite_comments:
+        raise ValueError("use either --resume-comments or --overwrite-comments")
     input_tex = args.input_tex.resolve()
     output_tex = (args.output_tex or default_output_path(input_tex)).resolve()
     comments_json = (args.comments_json or default_comments_path(output_tex)).resolve()
+    ensure_distinct_paths(
+        ("raw diff TeX", input_tex),
+        ("prepared review TeX", output_tex),
+        ("comments JSON", comments_json),
+    )
+    validate_prefix(args.prefix)
 
     tex = input_tex.read_text(encoding="utf-8")
     ensure_injectable(tex)
-    tex = inject_macro_block(tex)
-    head, body = split_document(tex)
-    line_offset = head.count("\n") + 1
-    prepared_body, blocks, skipped_lines = insert_placeholders(body, args.prefix, line_offset)
+    raw_head, _raw_body = split_document(tex)
+    raw_line_offset = raw_head.count("\n") + 1
+    prepared_input = inject_macro_block(tex)
+    head, body = split_document(prepared_input)
+    prepared_body, blocks, skipped_lines = insert_placeholders(body, args.prefix, raw_line_offset)
     prepared_tex = head + prepared_body
+    if comments_json.exists():
+        if args.resume_comments:
+            validate_comments_json(comments_json, blocks)
+        elif not args.overwrite_comments:
+            raise ValueError(
+                f"comments JSON already exists; refusing to overwrite: {comments_json}. "
+                "--overwrite-comments を使うか別 path を指定してください。"
+            )
+    elif args.resume_comments:
+        raise ValueError(
+            f"--resume-comments requires an existing comments JSON: {comments_json}"
+        )
 
-    output_tex.write_text(prepared_tex, encoding="utf-8")
-    write_comments_json(comments_json, blocks)
+    write_text_atomic(output_tex, prepared_tex)
+    if not args.resume_comments:
+        write_comments_json(comments_json, blocks, args.overwrite_comments)
 
     print(f"prepared_tex: {output_tex}")
     print(f"comments_json: {comments_json}")
