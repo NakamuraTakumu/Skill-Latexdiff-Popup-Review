@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""prepared review TeX 内の popup comment placeholders を fill する。
+"""prepared review TeX 内の popup comment placeholders を fill する保守用 helper。
+
+通常の popup review workflow では、この script を直接入口にしない。
+Git revisions から `popup_review_wizard.py` を起動し、wizard 経由でこの処理を使う。
 
 使用法:
   python3 fill_popup_comments.py REVIEW.tex COMMENTS.json
@@ -60,11 +63,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="comments JSON の ID に対応する placeholder がない場合や置換後も残る場合を error にしない。",
     )
-    p.add_argument(
-        "--allow-empty-comments",
-        action="store_true",
-        help="空または whitespace-only の comment values を許可する。通常は reviewed target の空 comment を拒否する。",
-    )
     return p.parse_args()
 
 
@@ -83,7 +81,7 @@ def encode_pdf_utf16_hex(text: str) -> str:
     return ("FEFF" + normalized.encode("utf-16-be").hex()).upper()
 
 
-def load_comments(path: Path, allow_empty_comments: bool = False) -> dict[str, str]:
+def load_comments(path: Path) -> dict[str, str]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("comments JSON must be an object keyed by diff ID")
@@ -91,8 +89,8 @@ def load_comments(path: Path, allow_empty_comments: bool = False) -> dict[str, s
     for key, value in payload.items():
         if not isinstance(key, str) or not isinstance(value, str):
             raise ValueError("comments JSON must contain string keys and string values")
-        if not allow_empty_comments and not value.strip():
-            raise ValueError(f"empty comment is not allowed for {key}; use --allow-empty-comments to override")
+        if not value.strip():
+            raise ValueError(f"empty comment is not allowed for {key}")
         out[key] = encode_pdf_utf16_hex(value)
     return out
 
@@ -131,7 +129,7 @@ def main() -> int:
 
     output_tex = review_tex if args.in_place else (args.output_tex or default_output_path(review_tex)).resolve()
     tex = review_tex.read_text(encoding="utf-8")
-    comments = load_comments(comments_json, args.allow_empty_comments)
+    comments = load_comments(comments_json)
     filled, missing, untouched, unfilled = fill_comments(tex, comments)
     if (missing or untouched) and not args.allow_placeholder_mismatches:
         details: list[str] = []

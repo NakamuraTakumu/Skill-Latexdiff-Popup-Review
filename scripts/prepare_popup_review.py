@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""popup placeholders 付きの latexdiff review copy を準備する。
+"""popup placeholders 付きの latexdiff review copy を準備する保守用 helper。
+
+通常の popup review workflow では、この script を直接入口にしない。
+Git revisions から `popup_review_wizard.py` を起動し、wizard 経由でこの処理を使う。
 
 使用法:
   python3 prepare_popup_review.py INPUT.tex
@@ -9,14 +12,14 @@
 この script の処理:
 - raw latexdiff TeX を別の review TeX に copy する
 - \\begin{document} の前に popup-annotation macro block を inject する
-- 各 safe DIF add/delete block の後に空の popup macro を 1 つ挿入する
-- direct popup insertion には unsafe な \\item / \\begin / \\end などの
-  structural diff blocks を skip する
+- 各 DIF add/delete block に空の popup macro を 1 つ対応させる
+- \\item / \\begin / \\end などの structural diff blocks では、その場に
+  popup macro を挿入せず、次の安全な位置へ移して挿入する
 - R001-D や R002-A のような stable sequential IDs を assign する
 - それらの IDs keyed の JSON skeleton を write する
 
 入力:
-- INPUT.tex: raw latexdiff artifact
+- INPUT.tex: wizard または保守作業で得た raw latexdiff artifact
 
 出力:
 - OUTPUT.tex: prepared review copy
@@ -88,6 +91,7 @@ class DiffBlock:
     placeholder: str
     line: int
     block: str
+    relocated: bool = False
 
 
 def is_safe_popup_target(block: str) -> bool:
@@ -112,11 +116,6 @@ def parse_args() -> argparse.Namespace:
         "--prefix",
         default="R",
         help="ID prefix。default: R",
-    )
-    p.add_argument(
-        "--overwrite-comments",
-        action="store_true",
-        help="既存 comments JSON を空 skeleton で置き換える。default は既存 file を拒否する。",
     )
     p.add_argument(
         "--resume-comments",
@@ -168,6 +167,10 @@ def placeholder_for(diff_id: str) -> str:
     return f"__COMMENT_{diff_id.replace('-', '_')}__"
 
 
+def popup_macro(diff_id: str, placeholder: str) -> str:
+    return f"\n\\DiffPopup{{{diff_id}}}{{{placeholder}}}\n"
+
+
 def split_document(tex: str) -> tuple[str, str]:
     marker = r"\begin{document}"
     head, sep, tail = tex.partition(marker)
@@ -176,29 +179,53 @@ def split_document(tex: str) -> tuple[str, str]:
     return head + sep, tail
 
 
+def split_document_end(body: str) -> tuple[str, str]:
+    marker = r"\end{document}"
+    head, sep, tail = body.rpartition(marker)
+    if not sep:
+        return body, ""
+    return head, sep + tail
+
+
+def flush_pending(out: list[str], pending_macros: list[str]) -> None:
+    if not pending_macros:
+        return
+    out.extend(pending_macros)
+    pending_macros.clear()
+
+
 def insert_placeholders(body: str, prefix: str, line_offset: int) -> tuple[str, list[DiffBlock], list[int]]:
     out: list[str] = []
     blocks: list[DiffBlock] = []
-    skipped_lines: list[int] = []
+    relocated_lines: list[int] = []
+    pending_macros: list[str] = []
     cursor = 0
     index = 0
+    body_without_end, document_end = split_document_end(body)
 
-    for match in BLOCK_RE.finditer(body):
+    for match in BLOCK_RE.finditer(body_without_end):
+        gap = body_without_end[cursor : match.start()]
+        out.append(gap)
+        if pending_macros and gap.strip():
+            flush_pending(out, pending_macros)
         block = match.group("block")
         kind = match.group("kind_fl") or match.group("kind_std")
-        line = line_offset + body.count("\n", 0, match.start())
-        out.append(body[cursor : match.end()])
+        line = line_offset + body_without_end.count("\n", 0, match.start())
+        out.append(block)
         cursor = match.end()
-
-        if not is_safe_popup_target(block):
-            skipped_lines.append(line)
-            continue
 
         index += 1
         diff_id = build_id(prefix, index, kind)
         placeholder = placeholder_for(diff_id)
-        macro = f"\n\\DiffPopup{{{diff_id}}}{{{placeholder}}}"
-        out.append(macro)
+        relocated = not is_safe_popup_target(block)
+        macro = popup_macro(diff_id, placeholder)
+        if relocated:
+            pending_macros.append(macro)
+            relocated_lines.append(line)
+        else:
+            if pending_macros:
+                flush_pending(out, pending_macros)
+            out.append(macro)
         blocks.append(
             DiffBlock(
                 id=diff_id,
@@ -206,11 +233,16 @@ def insert_placeholders(body: str, prefix: str, line_offset: int) -> tuple[str, 
                 placeholder=placeholder,
                 line=line,
                 block=block,
+                relocated=relocated,
             )
         )
 
-    out.append(body[cursor:])
-    return "".join(out), blocks, skipped_lines
+    tail = body_without_end[cursor:]
+    out.append(tail)
+    if pending_macros:
+        flush_pending(out, pending_macros)
+    out.append(document_end)
+    return "".join(out), blocks, relocated_lines
 
 
 def write_text_atomic(path: Path, text: str) -> None:
@@ -247,11 +279,11 @@ def validate_comments_json(path: Path, blocks: list[DiffBlock]) -> dict[str, str
     return out
 
 
-def write_comments_json(path: Path, blocks: list[DiffBlock], overwrite: bool) -> None:
-    if path.exists() and not overwrite:
+def write_comments_json(path: Path, blocks: list[DiffBlock]) -> None:
+    if path.exists():
         raise ValueError(
             f"comments JSON already exists; refusing to overwrite: {path}. "
-            "--overwrite-comments を使うか別 path を指定してください。"
+            "--resume-comments を使うか別 path を指定してください。"
         )
     payload = {block.id: "" for block in blocks}
     write_json_atomic(path, payload)
@@ -259,8 +291,6 @@ def write_comments_json(path: Path, blocks: list[DiffBlock], overwrite: bool) ->
 
 def main() -> int:
     args = parse_args()
-    if args.resume_comments and args.overwrite_comments:
-        raise ValueError("use either --resume-comments or --overwrite-comments")
     input_tex = args.input_tex.resolve()
     output_tex = (args.output_tex or default_output_path(input_tex)).resolve()
     comments_json = (args.comments_json or default_comments_path(output_tex)).resolve()
@@ -277,15 +307,15 @@ def main() -> int:
     raw_line_offset = raw_head.count("\n") + 1
     prepared_input = inject_macro_block(tex)
     head, body = split_document(prepared_input)
-    prepared_body, blocks, skipped_lines = insert_placeholders(body, args.prefix, raw_line_offset)
+    prepared_body, blocks, relocated_lines = insert_placeholders(body, args.prefix, raw_line_offset)
     prepared_tex = head + prepared_body
     if comments_json.exists():
         if args.resume_comments:
             validate_comments_json(comments_json, blocks)
-        elif not args.overwrite_comments:
+        else:
             raise ValueError(
                 f"comments JSON already exists; refusing to overwrite: {comments_json}. "
-                "--overwrite-comments を使うか別 path を指定してください。"
+                "--resume-comments を使うか別 path を指定してください。"
             )
     elif args.resume_comments:
         raise ValueError(
@@ -294,15 +324,15 @@ def main() -> int:
 
     write_text_atomic(output_tex, prepared_tex)
     if not args.resume_comments:
-        write_comments_json(comments_json, blocks, args.overwrite_comments)
+        write_comments_json(comments_json, blocks)
 
     print(f"prepared_tex: {output_tex}")
     print(f"comments_json: {comments_json}")
     print(f"diff_blocks: {len(blocks)}")
-    print(f"skipped_structural_blocks: {len(skipped_lines)}")
-    if skipped_lines:
-        preview = ", ".join(str(line) for line in skipped_lines[:20])
-        print(f"skipped_lines: {preview}")
+    print(f"relocated_structural_blocks: {len(relocated_lines)}")
+    if relocated_lines:
+        preview = ", ".join(str(line) for line in relocated_lines[:20])
+        print(f"relocated_lines: {preview}")
     for block in blocks[:20]:
         print(f"{block.id}\t{block.kind}\tline={block.line}")
     if len(blocks) > 20:

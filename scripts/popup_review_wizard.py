@@ -3,10 +3,6 @@
 
 使用法:
   python3 popup_review_wizard.py --output-dir out --master-tex main.tex --from-commit OLD --to-commit NEW
-  python3 popup_review_wizard.py BASELINE_HASH --master-tex main.tex
-  python3 popup_review_wizard.py BASELINE_HASH
-  python3 popup_review_wizard.py BASELINE_HASH --master-tex main.tex --no-build
-  python3 popup_review_wizard.py BASELINE_HASH --master-tex main.tex --generate-only
 
 この script の処理:
 - commit hash と master LaTeX file から latexdiff-vc を実行する
@@ -37,16 +33,15 @@ from prepare_popup_review import validate_prefix
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("baseline_hash", nargs="?", help="legacy mode: latexdiff-vc の -r に渡す Git hash。例: HEAD、abc1234")
-    p.add_argument("--from-commit", help="比較元 Git hash。--to-commit と併用すると two-revision mode になる。")
-    p.add_argument("--to-commit", help="比較先 Git hash。--from-commit と併用する。")
-    p.add_argument("--output-dir", type=Path, help="workflow artifact output directory。")
+    p.add_argument("--from-commit", required=True, help="比較元 Git hash。")
+    p.add_argument("--to-commit", required=True, help="比較先 Git hash。")
+    p.add_argument("--output-dir", type=Path, required=True, help="workflow artifact output directory。")
     p.add_argument(
         "--master-tex",
         type=Path,
+        required=True,
         help=(
-            "master LaTeX file。省略時は対話で入力する。"
-            "--project-root 省略時の相対 path は実行 cwd 基準、"
+            "master LaTeX file。--project-root 省略時の相対 path は実行 cwd 基準、"
             "--project-root 指定時の相対 path は project root 基準。"
         ),
     )
@@ -59,7 +54,7 @@ def parse_args() -> argparse.Namespace:
         "-d",
         "--diff-dir",
         type=Path,
-        help="latexdiff-vc output directory。省略時は --output-dir、legacy mode では diff。",
+        help="latexdiff-vc output directory。省略時は --output-dir/raw_diff。",
     )
     p.add_argument("--review-tex", type=Path, help="prepared review TeX path。")
     p.add_argument("--comments-json", type=Path, help="comments JSON path。")
@@ -75,6 +70,15 @@ def parse_args() -> argparse.Namespace:
         help="latexdiff-vc command path。default: latexdiff-vc",
     )
     p.add_argument(
+        "--latexdiff-option",
+        action="append",
+        default=[],
+        help=(
+            "latexdiff-vc に追加で渡す option。複数回指定可。"
+            "例: --latexdiff-option=--append-textcmd=new,delete"
+        ),
+    )
+    p.add_argument(
         "--build-command",
         default="latexmk -pdf -interaction=nonstopmode -halt-on-error -outdir={pdf_dir} {tex}",
         help="PDF build command。{tex} は build cwd からの相対 TeX path、{pdf_output}/{pdf_dir} は expected PDF path に置換される。",
@@ -85,17 +89,11 @@ def parse_args() -> argparse.Namespace:
         help="build command の working directory。default: master TeX file の directory",
     )
     p.add_argument("--pdf-output", type=Path, help="expected generated PDF path。省略時は filled TeX の拡張子を .pdf にする。")
-    p.add_argument("--generate-only", action="store_true", help="latexdiff-vc で raw diff TeX を生成して終了する。")
     p.add_argument("--no-build", action="store_true", help="filled TeX 作成後に PDF build を行わない。")
     p.add_argument(
         "--keep-build-files",
         action="store_true",
         help="PDF build 成功後も LaTeX の一時補助ファイルを残す。default は削除する。",
-    )
-    p.add_argument(
-        "--overwrite-comments",
-        action="store_true",
-        help="既存 comments JSON を空 skeleton で置き換える。default は既存 file を拒否する。",
     )
     p.add_argument(
         "--resume-comments",
@@ -107,25 +105,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="--build-cwd が存在しない場合に作成する。default は既存 directory を要求する。",
     )
-    p.add_argument(
-        "--allow-empty-comments",
-        action="store_true",
-        help="空 comment を許可する。通常は未入力を許可しない。",
-    )
-    p.add_argument(
-        "--manual-comments",
-        action="store_true",
-        help="Codex handoff ではなく diff ID ごとの対話入力で comments JSON を作る。",
-    )
     return p.parse_args()
-
-
-def prompt_path(label: str) -> Path:
-    while True:
-        value = input(f"{label}: ").strip()
-        if value:
-            return Path(value)
-        print("path を入力してください。")
 
 
 def resolve_under_root(path: Path, root: Path) -> Path:
@@ -184,14 +164,17 @@ def write_json_atomic(path: Path, payload: Mapping[str, str]) -> None:
     tmp.replace(path)
 
 
-def write_comments_skeleton(path: Path, blocks: list[DiffBlock], overwrite: bool) -> None:
-    if path.exists() and not overwrite:
+def write_comments_skeleton(path: Path, blocks: list[DiffBlock]) -> None:
+    if path.exists():
         raise ValueError(
             f"comments JSON already exists; refusing unsafe reuse or overwrite: {path}. "
-            "別 path を指定するか --resume-comments または --overwrite-comments を使ってください。"
+            "別 path を指定するか --resume-comments を使ってください。"
         )
     payload: dict[str, str] = {block.id: "" for block in blocks}
     write_json_atomic(path, payload)
+
+
+MEANING_LABELS = ("[意味維持]", "[意味変化あり]", "[意味変化要確認]")
 
 
 def validate_comments_json(path: Path, blocks: list[DiffBlock]) -> dict[str, str]:
@@ -217,15 +200,41 @@ def validate_comments_json(path: Path, blocks: list[DiffBlock]) -> dict[str, str
     return out
 
 
+def validate_comment_contract(path: Path) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("comments JSON must be an object")
+    empty: list[str] = []
+    missing_meaning_label: list[str] = []
+    for key, value in payload.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("comments JSON must contain string keys and string values")
+        if not value.strip():
+            empty.append(key)
+            continue
+        if not any(label in value for label in MEANING_LABELS):
+            missing_meaning_label.append(key)
+    if empty:
+        raise ValueError("comment が空の ID があります: " + ", ".join(empty[:20]))
+    if missing_meaning_label:
+        raise ValueError(
+            "meaning label がない ID があります: "
+            + ", ".join(missing_meaning_label[:20])
+            + f"; required one of: {', '.join(MEANING_LABELS)}"
+        )
+
+
 def run_latexdiff(
-    baseline_hash: str,
-    target_hash: str | None,
+    from_commit: str,
+    to_commit: str,
     master_tex: Path,
     project_root: Path,
     diff_dir: Path,
     command: str,
+    latexdiff_options: list[str],
 ) -> Path:
     diff_dir_abs = resolve_under_root(diff_dir, project_root).resolve()
+    diff_dir_abs.mkdir(parents=True, exist_ok=True)
     diff_dir_arg = relative_to_root(diff_dir_abs, project_root)
     master_arg = relative_to_root(master_tex, project_root)
     before = tex_files(diff_dir_abs)
@@ -237,10 +246,11 @@ def run_latexdiff(
         "-d",
         diff_dir_arg,
         "-r",
-        baseline_hash,
+        from_commit,
+        "-r",
+        to_commit,
     ]
-    if target_hash is not None:
-        cmd.extend(["-r", target_hash])
+    cmd.extend(latexdiff_options)
     cmd.append(master_arg)
     print("Running: " + " ".join(shlex.quote(part) for part in cmd))
     subprocess.run(cmd, cwd=project_root, check=True)
@@ -268,11 +278,8 @@ def prepare_review_tex(
     review_tex: Path | None,
     comments_json: Path | None,
     prefix: str,
-    overwrite_comments: bool,
     resume_comments: bool,
 ) -> tuple[Path, Path, list[DiffBlock], list[int]]:
-    if overwrite_comments and resume_comments:
-        raise ValueError("use either --resume-comments or --overwrite-comments")
     output_tex = (review_tex or default_output_path(raw_tex)).resolve()
     comments_path = (comments_json or default_comments_path(output_tex)).resolve()
     ensure_distinct_paths(
@@ -287,66 +294,22 @@ def prepare_review_tex(
     raw_line_offset = raw_head.count("\n") + 1
     tex = inject_macro_block(tex)
     head, body = split_document(tex)
-    prepared_body, blocks, skipped_lines = insert_placeholders(body, prefix, raw_line_offset)
+    prepared_body, blocks, relocated_lines = insert_placeholders(body, prefix, raw_line_offset)
     if comments_path.exists():
         if resume_comments:
             validate_comments_json(comments_path, blocks)
-        elif not overwrite_comments:
+        else:
             raise ValueError(
                 f"comments JSON already exists; refusing unsafe reuse or overwrite: {comments_path}. "
-                "別 path を指定するか --resume-comments または --overwrite-comments を使ってください。"
+                "別 path を指定するか --resume-comments を使ってください。"
             )
     elif resume_comments:
         raise ValueError(f"--resume-comments requires an existing comments JSON: {comments_path}")
     output_tex.parent.mkdir(parents=True, exist_ok=True)
     output_tex.write_text(head + prepared_body, encoding="utf-8")
     if not resume_comments:
-        write_comments_skeleton(comments_path, blocks, overwrite_comments)
-    return output_tex, comments_path, blocks, skipped_lines
-
-
-def compact_snippet(text: str, limit: int = 500) -> str:
-    snippet = " ".join(text.split())
-    if len(snippet) <= limit:
-        return snippet
-    return snippet[: limit - 3] + "..."
-
-
-def prompt_comment(block: DiffBlock, previous: str | None, allow_empty: bool) -> str:
-    print()
-    print(f"{block.id} ({block.kind}, line {block.line})")
-    print(compact_snippet(block.block))
-    if previous:
-        print("Enter: 前回の comment を再利用 / :same: 前回の comment を再利用")
-    print("comment を入力してください。")
-    while True:
-        value = input("> ").strip()
-        if value == ":same" and previous:
-            return previous
-        if value == "" and previous:
-            return previous
-        if value or allow_empty:
-            return value
-        print("空 comment は許可されていません。入力してください。")
-
-
-def collect_comments(comments_json: Path, blocks: list[DiffBlock], allow_empty: bool) -> None:
-    payload = json.loads(comments_json.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("comments JSON must be an object")
-
-    previous: str | None = None
-    for block in blocks:
-        existing = payload.get(block.id, "")
-        if isinstance(existing, str) and existing.strip():
-            print(f"{block.id}: existing comment を保持します。")
-            previous = existing
-            continue
-        comment = prompt_comment(block, previous, allow_empty)
-        payload[block.id] = comment
-        write_json_atomic(comments_json, payload)
-        if comment:
-            previous = comment
+        write_comments_skeleton(comments_path, blocks)
+    return output_tex, comments_path, blocks, relocated_lines
 
 
 def wait_for_codex_comments(comments_json: Path) -> None:
@@ -362,19 +325,11 @@ def wait_for_codex_comments(comments_json: Path) -> None:
         raise RuntimeError("interactive stdin is required; rerun in a terminal, or rerun later with --resume-comments") from None
 
 
-def ensure_complete_comments(comments_json: Path, allow_empty: bool) -> None:
-    payload = json.loads(comments_json.read_text(encoding="utf-8"))
-    missing = [key for key, value in payload.items() if not isinstance(value, str) or not value.strip()]
-    if missing and not allow_empty:
-        preview = ", ".join(missing[:20])
-        raise ValueError(f"comment が空の ID があります: {preview}")
-
-
-def fill_review_tex(review_tex: Path, comments_json: Path, filled_tex: Path | None, allow_empty: bool) -> Path:
+def fill_review_tex(review_tex: Path, comments_json: Path, filled_tex: Path | None) -> Path:
     output_tex = (filled_tex or default_filled_path(review_tex)).resolve()
     ensure_distinct_paths(("prepared review TeX", review_tex), ("filled review TeX", output_tex))
     tex = review_tex.read_text(encoding="utf-8")
-    comments = load_comments(comments_json, allow_empty)
+    comments = load_comments(comments_json)
     filled, missing, untouched, unfilled = fill_comments(tex, comments)
     if missing:
         raise ValueError("placeholder が見つからない ID があります: " + ", ".join(missing[:20]))
@@ -455,23 +410,9 @@ def build_pdf(
 def main() -> int:
     args = parse_args()
 
-    if args.from_commit or args.to_commit:
-        if not args.from_commit or not args.to_commit:
-            raise ValueError("--from-commit and --to-commit must be used together")
-        if args.baseline_hash:
-            raise ValueError("do not combine positional BASELINE_HASH with --from-commit/--to-commit")
-        baseline_hash = args.from_commit
-        target_hash = args.to_commit
-    else:
-        if not args.baseline_hash:
-            raise ValueError("provide BASELINE_HASH or --from-commit/--to-commit")
-        baseline_hash = args.baseline_hash
-        target_hash = None
-
-    if args.master_tex is None:
-        master_input = prompt_path("master TeX file")
-    else:
-        master_input = args.master_tex
+    from_commit = args.from_commit
+    to_commit = args.to_commit
+    master_input = args.master_tex
 
     if args.project_root is None:
         master_tex = master_input.resolve()
@@ -488,59 +429,56 @@ def main() -> int:
             f"master TeX file が見つかりません: {master_tex}. "
             "--project-root を指定していない場合、相対 --master-tex は実行 cwd 基準で解決されます。"
         )
-    output_dir = resolve_under_root(args.output_dir, project_root).resolve() if args.output_dir else None
-    if output_dir is not None:
-        output_dir.mkdir(parents=True, exist_ok=True)
-    diff_dir = args.diff_dir or output_dir or Path("diff")
+    output_dir = resolve_under_root(args.output_dir, project_root).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    diff_dir = resolve_under_root(args.diff_dir, project_root).resolve() if args.diff_dir else output_dir / "raw_diff"
+    if diff_dir.resolve() == output_dir.resolve():
+        raise ValueError("--diff-dir must differ from --output-dir; raw latexdiff TeX belongs in a separate directory")
     review_tex = resolve_optional_under_root(args.review_tex, project_root)
     comments_json = resolve_optional_under_root(args.comments_json, project_root)
     filled_tex_arg = resolve_optional_under_root(args.filled_tex, project_root)
     build_cwd = resolve_under_root(args.build_cwd, project_root).resolve() if args.build_cwd else master_tex.parent
     pdf_output = resolve_optional_under_root(args.pdf_output, project_root)
-    if output_dir is not None:
-        review_tex = review_tex or (output_dir / "popup_review.tex")
-        comments_json = comments_json or (output_dir / "popup_comments.json")
-        filled_tex_arg = filled_tex_arg or (output_dir / "popup_review_filled.tex")
-        pdf_output = pdf_output or (output_dir / "popup_review_filled.pdf")
+    review_tex = review_tex or (output_dir / "popup_review.tex")
+    comments_json = comments_json or (output_dir / "popup_comments.json")
+    filled_tex_arg = filled_tex_arg or (output_dir / "popup_review_filled.tex")
+    pdf_output = pdf_output or (output_dir / "popup_review_filled.pdf")
 
     raw_tex = run_latexdiff(
-        baseline_hash=baseline_hash,
-        target_hash=target_hash,
+        from_commit=from_commit,
+        to_commit=to_commit,
         master_tex=master_tex,
         project_root=project_root,
         diff_dir=diff_dir,
         command=args.latexdiff_command,
+        latexdiff_options=args.latexdiff_option,
     )
     print(f"raw_diff_tex: {raw_tex}")
-    if args.generate_only:
-        return 0
 
-    source_diff = None
-    if output_dir is not None and target_hash is not None:
-        source_diff = output_dir / "source.diff"
-        write_source_diff(project_root, baseline_hash, target_hash, source_diff)
-        print(f"source_diff: {source_diff}")
+    source_diff = output_dir / "source.diff"
+    write_source_diff(project_root, from_commit, to_commit, source_diff)
+    print(f"source_diff: {source_diff}")
 
-    review_tex, comments_json, blocks, skipped_lines = prepare_review_tex(
+    review_tex, comments_json, blocks, relocated_lines = prepare_review_tex(
         raw_tex=raw_tex,
         review_tex=review_tex,
         comments_json=comments_json,
         prefix=args.prefix,
-        overwrite_comments=args.overwrite_comments,
         resume_comments=args.resume_comments,
     )
     print(f"prepared_review_tex: {review_tex}")
     print(f"comments_json: {comments_json}")
     print(f"diff_blocks: {len(blocks)}")
-    print(f"skipped_structural_blocks: {len(skipped_lines)}")
+    print(f"relocated_structural_blocks: {len(relocated_lines)}")
+    if relocated_lines:
+        preview = ", ".join(str(line) for line in relocated_lines[:20])
+        print(f"relocated_lines: {preview}")
 
-    if args.manual_comments or source_diff is None:
-        collect_comments(comments_json, blocks, args.allow_empty_comments)
-    else:
-        wait_for_codex_comments(comments_json)
-    ensure_complete_comments(comments_json, args.allow_empty_comments)
+    wait_for_codex_comments(comments_json)
+    validate_comments_json(comments_json, blocks)
+    validate_comment_contract(comments_json)
 
-    filled_tex = fill_review_tex(review_tex, comments_json, filled_tex_arg, args.allow_empty_comments)
+    filled_tex = fill_review_tex(review_tex, comments_json, filled_tex_arg)
     print(f"filled_tex: {filled_tex}")
 
     if args.no_build:
