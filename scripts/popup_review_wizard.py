@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Git revisions から popup-comment latexdiff review PDF までを作る。
+"""Git revisions または作業中 snapshot から popup-comment latexdiff review PDF までを作る。
 
 使用法:
   python3 popup_review_wizard.py --output-dir out --master-tex main.tex --from-commit OLD --to-commit NEW
+  python3 popup_review_wizard.py --output-dir out --master-tex main.tex --to-index
+  python3 popup_review_wizard.py --output-dir out --master-tex main.tex --to-worktree
 
 この script の処理:
-- commit hash と master LaTeX file から latexdiff-vc を実行する
+- Git revision または自動生成 snapshot commit と master LaTeX file から latexdiff-vc を実行する
 - raw latexdiff TeX に popup placeholders を追加する
 - Codex に comments JSON 作成指示を出し、完了後に検証する
 - comments を filled review TeX に挿入する
@@ -16,9 +18,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import shlex
 import subprocess
 import sys
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -32,9 +37,19 @@ from prepare_popup_review import validate_prefix
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--from-commit", required=True, help="比較元 Git hash。")
-    p.add_argument("--to-commit", required=True, help="比較先 Git hash。")
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument(
+        "--from-commit",
+        help="比較元 Git revision。--to-index/--to-worktree では省略時 HEAD。",
+    )
+    target = p.add_mutually_exclusive_group(required=True)
+    target.add_argument("--to-commit", help="比較先 Git revision。")
+    target.add_argument("--to-index", action="store_true", help="現在の staged/index 状態を比較先 snapshot にする。")
+    target.add_argument(
+        "--to-worktree",
+        action="store_true",
+        help="現在の working tree 状態を比較先 snapshot にする。untracked file は staged されたものだけ含める。",
+    )
     p.add_argument("--output-dir", type=Path, required=True, help="workflow artifact output directory。")
     p.add_argument(
         "--master-tex",
@@ -105,7 +120,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="--build-cwd が存在しない場合に作成する。default は既存 directory を要求する。",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.to_commit and not args.from_commit:
+        p.error("--to-commit requires --from-commit")
+    if not args.from_commit:
+        args.from_commit = "HEAD"
+    return args
 
 
 def resolve_under_root(path: Path, root: Path) -> Path:
@@ -125,6 +145,75 @@ def git_root_for(path: Path) -> Path:
         text=True,
     )
     return Path(out.strip()).resolve()
+
+
+def git_output(project_root: Path, args: list[str], env: Mapping[str, str] | None = None) -> str:
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+    out = subprocess.check_output(
+        ["git", "-C", str(project_root), *args],
+        text=True,
+        env=run_env,
+    )
+    return out.strip()
+
+
+def git_run(project_root: Path, args: list[str], env: Mapping[str, str] | None = None) -> None:
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+    subprocess.run(["git", "-C", str(project_root), *args], check=True, env=run_env)
+
+
+def snapshot_commit_env() -> dict[str, str]:
+    return {
+        "GIT_AUTHOR_NAME": "Codex Popup Review",
+        "GIT_AUTHOR_EMAIL": "codex-popup-review@example.invalid",
+        "GIT_COMMITTER_NAME": "Codex Popup Review",
+        "GIT_COMMITTER_EMAIL": "codex-popup-review@example.invalid",
+    }
+
+
+def commit_tree_snapshot(project_root: Path, tree: str, parent: str, label: str) -> str:
+    commit = git_output(
+        project_root,
+        ["commit-tree", tree, "-p", parent, "-m", f"popup review {label} snapshot"],
+        env=snapshot_commit_env(),
+    )
+    print(f"{label}_snapshot_commit: {commit}")
+    return commit
+
+
+def create_index_snapshot_commit(project_root: Path, parent: str) -> str:
+    tree = git_output(project_root, ["write-tree"])
+    return commit_tree_snapshot(project_root, tree, parent, "index")
+
+
+def create_worktree_snapshot_commit(project_root: Path, parent: str) -> str:
+    index_path = Path(git_output(project_root, ["rev-parse", "--git-path", "index"]))
+    if not index_path.is_absolute():
+        index_path = project_root / index_path
+    with tempfile.TemporaryDirectory(prefix="popup-review-index-") as tmp_dir:
+        temp_index = Path(tmp_dir) / "index"
+        if index_path.exists():
+            shutil.copy2(index_path, temp_index)
+        temp_env = {"GIT_INDEX_FILE": str(temp_index)}
+        git_run(project_root, ["add", "-u", "--", "."], env=temp_env)
+        tree = git_output(project_root, ["write-tree"], env=temp_env)
+    commit = commit_tree_snapshot(project_root, tree, parent, "worktree")
+    print("worktree_snapshot_note: untracked files are included only if already staged")
+    return commit
+
+
+def resolve_target_revision(args: argparse.Namespace, project_root: Path, from_commit: str) -> str:
+    if args.to_commit:
+        return args.to_commit
+    if args.to_index:
+        return create_index_snapshot_commit(project_root, from_commit)
+    if args.to_worktree:
+        return create_worktree_snapshot_commit(project_root, from_commit)
+    raise ValueError("target revision is not specified")
 
 
 def relative_to_root(path: Path, root: Path) -> str:
@@ -411,7 +500,6 @@ def main() -> int:
     args = parse_args()
 
     from_commit = args.from_commit
-    to_commit = args.to_commit
     master_input = args.master_tex
 
     if args.project_root is None:
@@ -422,6 +510,9 @@ def main() -> int:
     if not project_root.is_dir():
         raise ValueError(f"project root does not exist or is not a directory: {project_root}")
     validate_prefix(args.prefix)
+    to_commit = resolve_target_revision(args, project_root, from_commit)
+    print(f"from_revision: {from_commit}")
+    print(f"to_revision: {to_commit}")
     if args.project_root is not None:
         master_tex = resolve_under_root(master_input, project_root).resolve()
     if not master_tex.exists():

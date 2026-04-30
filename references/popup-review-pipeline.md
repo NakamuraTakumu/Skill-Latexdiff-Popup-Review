@@ -2,37 +2,42 @@
 
 ## 目的
 
-Git 管理された LaTeX project から `latexdiff` を生成し、`paper-review` 基準の所見を Adobe Acrobat / Reader 向け popup 注釈付き PDF に変換する。
+Git 管理された LaTeX project から `latexdiff` を生成し、`paper-review` を呼び出して作成した Markdown note の所見を Adobe Acrobat / Reader 向け popup 注釈付き PDF に変換する。
 
 ## 責務
 
 - **wizard**: diff 生成、popup ID 付与、`comments JSON` skeleton 作成、コメント埋め込み、PDF build を行う。
-- **Codex**: wizard が待機した後、`comments JSON` だけを編集する。
+- **Codex**: wizard が待機した後、`paper-review` を呼び出して Markdown note を作成し、その所見から `comments JSON` を編集する。
 - **禁止**: Codex は raw diff TeX、prepared review TeX、filled review TeX を直接編集しない。
 - **実行形態**: wizard は対話実行専用。再開情報は `comments JSON` だけに集約する。
 - **復旧**: process が終了した場合は、同じ command に `--resume-comments` を付けて再実行する。
 
 ## 入力
 
-- **baseline revision**: 比較元 Git revision。
-- **target revision**: 比較先 Git revision。
+- **baseline revision**: 比較元 Git revision。snapshot mode では省略時 `HEAD`。
+- **target 指定**: 比較先 Git revision、staged/index snapshot、または working tree snapshot のいずれか。
 - **master TeX**: `latexdiff-vc` に渡す main TeX file。
 - **output directory**: 生成物の保存先。
 - **project root**: Git root。通常は `master TeX` から wizard が検出する。
 
-不明な入力は質問し、推測で確定しない。既存 raw diff TeX は入口にしない。
+不明な入力は質問し、推測で確定しない。既存 raw diff TeX は入口にしない。作業中差分を扱う場合も wizard が一時 snapshot commit を生成する。
 
 ## 実行
 
 ```bash
 python3 /path/to/latexdiff-popup-review/scripts/popup_review_wizard.py --output-dir OUT --master-tex MAIN.tex --from-commit OLD --to-commit NEW
+python3 /path/to/latexdiff-popup-review/scripts/popup_review_wizard.py --output-dir OUT --master-tex MAIN.tex --to-index
+python3 /path/to/latexdiff-popup-review/scripts/popup_review_wizard.py --output-dir OUT --master-tex MAIN.tex --to-worktree
 ```
 
 主な options:
 
 - `--output-dir`: 必須。source diff、prepared review TeX、`comments JSON`、filled review TeX、PDF の出力先。raw diff TeX は既定で `OUT/raw_diff/` に分離する。
 - `--master-tex`: 必須。main TeX file。`--project-root` なしの相対 path は実行 cwd 基準、`--project-root` ありの相対 path は project root 基準。
-- `--from-commit`, `--to-commit`: 必須。比較元・比較先 Git revision。
+- `--from-commit`: 比較元 Git revision。`--to-commit` では必須、snapshot mode では省略時 `HEAD`。
+- `--to-commit`: 比較先 Git revision。`--to-index`、`--to-worktree` と同時指定しない。
+- `--to-index`: 現在の staged/index 状態を一時 commit にして比較先にする。unstaged 変更は含めない。
+- `--to-worktree`: 現在の working tree の tracked 変更を一時 commit にして比較先にする。untracked file は staged されたものだけ含める。
 - `--diff-dir`: raw diff TeX の出力先。省略時は `OUT/raw_diff/`。`--output-dir` と同じ path は使わない。
 - `--latexdiff-option`: `latexdiff-vc` に追加で渡す option。複数回指定可。project 固有 text macro は `--latexdiff-option=--append-textcmd=macroA,macroB` で text command として扱わせる。
 - `--build-cwd`: PDF build command の working directory。省略時は `master TeX` の directory。
@@ -43,37 +48,38 @@ python3 /path/to/latexdiff-popup-review/scripts/popup_review_wizard.py --output-
 ## 処理フロー
 
 1. wizard を起動する。
-2. wizard が raw diff TeX、source diff、prepared review TeX、`comments JSON` skeleton を生成して待機する。
-3. Codex は stdout に出た path から `source diff` と prepared review TeX を確認し、`comments JSON` だけを完成させる。
-4. Codex は待機中の wizard process に Enter を送る。
-5. wizard が `comments JSON` を検証し、filled review TeX と review PDF を生成する。
-6. PDF build 成功後、`--keep-build-files` がない限り LaTeX 一時補助ファイルを削除する。build failure 時は原因調査のため残す。
+2. snapshot mode の場合、wizard が target snapshot commit を生成する。
+3. wizard が raw diff TeX、source diff、prepared review TeX、`comments JSON` skeleton を生成して待機する。
+4. Codex は stdout に出た path から `source diff` と prepared review TeX を確認し、`paper-review` を呼び出して Markdown note を作成してから `comments JSON` を完成させる。
+5. Codex は待機中の wizard process に Enter を送る。
+6. wizard が `comments JSON` を検証し、filled review TeX と review PDF を生成する。
+7. PDF build 成功後、`--keep-build-files` がない限り LaTeX 一時補助ファイルを削除する。build failure 時は原因調査のため残す。
 
 ## レビュー方針
 
 - 実体的レビューは **meaning unit** 単位で行う。1 hunk から複数所見、または複数 changed lines から 1 所見があり得る。
-- `paper-review` の `review-only` 相当で findings を作る。ただし Markdown note は作らず、findings は `comments JSON` 作成の中間表現として扱う。
-- 評価基準は `paper-review/references/criteria.md` の relevant な部分を使う。diff 内の manuscript changes が safe、local、meaning-preserving か判断する場合は `paper-review/references/revision-principles.md` も使う。
+- `paper-review` を `review-only` mode で呼び出し、Markdown note を通常成果物として作成または更新させる。以前のように Markdown note 出力を抑制しない。
+- 実体的レビューの評価基準、出力 schema、Markdown note の保存は `paper-review` に従う。diff 内の manuscript changes が safe、local、meaning-preserving か判断する場合も `paper-review` の revision 判断を使う。
 - popup comment は prepared review TeX にある ID だけへ割り当てる。
-- findings の `Issue Reason`、severity、revision judgment は popup comment body に要約して流用する。
-- finding が複数 popup IDs に対応する場合は、各 ID の delete/add 役割に合わせて同じ判断を言い換える。
+- Markdown note の `問題理由`、`重大度`、`修正 -> 意味ずれ` は popup comment body に要約して流用する。
+- 所見が複数 popup IDs に対応する場合は、各 ID の delete/add 役割に合わせて同じ判断を言い換える。
 - `source diff` だけに現れる重要な問題は、検証報告の注意事項として扱う。
 - 評価に必要な source、PDF、画像、基準が不足する場合は、推測で確定せず不足情報を明示する。
 - 同じ **meaning unit** から delete と add の両対象が出た場合、1 つの所見が複数の popup IDs に対応してよい。
 
-### Findings to comments mapping
+### Markdown note to comments mapping
 
-`paper-review` findings は保存用 note ではなく、次の中間情報として扱う:
+Markdown note の所見は保存用記録であり、次の情報を `comments JSON` へ変換する:
 
-- **finding title**: comment 本文には必要な場合だけ短く含める。
-- **Issue Reason**: comment 本文の中心にする。
-- **Severity**: `major`、`moderate`、`minor` は原則 `[懸念]`、`nit` は内容に応じて `[懸念]` または `[要確認]` にする。
-- **Revision -> Nuance Shift**: `[意味維持]`、`[意味変化あり]`、`[意味変化要確認]` の判断に使う。
+- **所見タイトル**: comment 本文には必要な場合だけ短く含める。
+- **問題理由**: comment 本文の中心にする。
+- **重大度**: `major`、`moderate`、`minor` は原則 `[懸念]`、`nit` は内容に応じて `[懸念]` または `[要確認]` にする。
+- **修正 -> 意味ずれ**: `[意味維持]`、`[意味変化あり]`、`[意味変化要確認]` の判断に使う。
 - **popup IDs**: prepared review TeX の diff ID にだけ割り当てる。
 
 comment label の対応:
 
-- **問題を指摘する finding**: `[懸念]`。
+- **問題を指摘する所見**: `[懸念]`。
 - **evidence 不足または判断保留**: `[要確認]`。
 - **実体的所見がない補完 comment**: `[OK]`。
 
