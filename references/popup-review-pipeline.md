@@ -136,6 +136,7 @@ delete と add の対応関係は解釈に使ってよい。comment は ID ご�
 - すべての comment に `[意味維持]`、`[意味変化あり]`、`[意味変化要確認]` のいずれかがある。
 - filled review TeX に unfilled placeholder がない。
 - PDF build 実行時は、期待する PDF path が存在する。
+- PDF build 成功後は、PDF path の存在確認で完了とする。PDF 内部 object、annotation count、page image、viewer 表示の追加検査は、ユーザーが明示した場合または build artifact の破損が疑われる場合だけ行う。
 - `--no-build` 使用時は、filled review TeX と `comments JSON` の path を成果物として確認し、PDF path を成果物として扱わない。
 
 試運転の成功条件は script の入出力契約が通ることを中心に判断する。図、layout、spacing、screenshot、image などの視覚 rendering が対象でない限り、PDF の page image 化や viewer による visual spot check は行わない。

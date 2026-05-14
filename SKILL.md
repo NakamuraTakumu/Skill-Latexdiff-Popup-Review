@@ -63,4 +63,4 @@ python3 /path/to/latexdiff-popup-review/scripts/popup_review_wizard.py --output-
 - **既定の成果物**: Markdown note と popup 注釈付き PDF。
 - **Markdown note**: `paper-review` の通常成果物として保存する。mode は `review-only` とし、[../paper-review/references/output-note.md](../paper-review/references/output-note.md) の `## Content` schema に従う。
 - **`--no-build` 使用時**: filled review TeX と `comments JSON` を成果物として報告し、PDF path は成果物として扱わない。
-- **検証報告**: Markdown note path、build command の結果、生成 PDF path、コメントの充足状況、popup macro を移動した構造的 diff、主要な注意事項を含める。
+- **検証報告**: Markdown note path、build command の結果、生成 PDF path、コメントの充足状況、popup macro を移動した構造的 diff、主要な注意事項を含める。PDF build 成功後の PDF 内部検査、page image 化、viewer 相当の注釈確認は既定では行わない。
