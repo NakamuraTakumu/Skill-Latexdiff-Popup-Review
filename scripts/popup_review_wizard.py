@@ -27,13 +27,22 @@ import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
-from fill_popup_comments import default_output_path as default_filled_path
-from fill_popup_comments import fill_comments, load_comments
-from prepare_popup_review import DiffBlock
-from prepare_popup_review import default_comments_path, default_output_path
-from prepare_popup_review import ensure_injectable, inject_macro_block, insert_placeholders
-from prepare_popup_review import split_document
-from prepare_popup_review import validate_prefix
+try:
+    from .fill_popup_comments import default_output_path as default_filled_path
+    from .fill_popup_comments import fill_comments, load_comments
+    from .prepare_popup_review import DiffBlock
+    from .prepare_popup_review import default_comments_path, default_output_path
+    from .prepare_popup_review import ensure_injectable, inject_macro_block, insert_placeholders
+    from .prepare_popup_review import split_document
+    from .prepare_popup_review import validate_prefix
+except ImportError:  # Direct script execution from the scripts directory.
+    from fill_popup_comments import default_output_path as default_filled_path
+    from fill_popup_comments import fill_comments, load_comments
+    from prepare_popup_review import DiffBlock
+    from prepare_popup_review import default_comments_path, default_output_path
+    from prepare_popup_review import ensure_injectable, inject_macro_block, insert_placeholders
+    from prepare_popup_review import split_document
+    from prepare_popup_review import validate_prefix
 
 
 def parse_args() -> argparse.Namespace:
@@ -436,26 +445,43 @@ LATEX_BUILD_EXTENSIONS = (
     ".bbl",
     ".bcf",
     ".blg",
+    ".dvi",
     ".fdb_latexmk",
     ".fls",
+    ".idx",
+    ".ilg",
+    ".ind",
     ".lof",
     ".log",
     ".lot",
+    ".nav",
     ".out",
     ".run.xml",
+    ".snm",
     ".synctex.gz",
     ".toc",
+    ".vrb",
+    ".xdv",
 )
 
 
-def cleanup_latex_build_files(filled_tex: Path, expected_pdf: Path) -> list[Path]:
+def cleanup_latex_build_files(
+    filled_tex: Path,
+    expected_pdf: Path,
+    *,
+    jobname: str | None = None,
+) -> list[Path]:
     build_dir = expected_pdf.parent
+    basename = jobname or filled_tex.stem
     removed: list[Path] = []
     for ext in LATEX_BUILD_EXTENSIONS:
-        path = build_dir / f"{filled_tex.stem}{ext}"
-        if not path.exists() or path.resolve() in {filled_tex.resolve(), expected_pdf.resolve()}:
+        path = build_dir / f"{basename}{ext}"
+        if (not path.exists() and not path.is_symlink()) or path.resolve() in {
+            filled_tex.resolve(),
+            expected_pdf.resolve(),
+        }:
             continue
-        if path.is_file():
+        if path.is_file() or path.is_symlink():
             path.unlink()
             removed.append(path)
     return removed

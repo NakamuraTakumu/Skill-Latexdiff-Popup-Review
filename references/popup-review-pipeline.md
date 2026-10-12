@@ -1,142 +1,126 @@
 # Popup Review Pipeline
 
-## 目的
+## 経路
 
-Git 管理された LaTeX project から `latexdiff` を生成し、`paper-review` を呼び出して作成した Markdown note の所見を Adobe Acrobat / Reader 向け popup 注釈付き PDF に変換する。
+Job 経路の公開入口は `scripts/run_popup_review.py` である。
+既存の対話入口 `scripts/popup_review_wizard.py` は legacy 互換として残す。
 
-## 責務
+Job 経路は baseline Git revision、target revision または snapshot、master TeX、空の output directory を受け取る。
+`--input-file` は追加の任意ファイルを受け取り、`--prompt` は追加のユーザー要求を受け取る。
+snapshot は branch、HEAD、index、working tree を変更しない。
 
-- **wizard**: diff 生成、popup ID 付与、`comments JSON` skeleton 作成、コメント埋め込み、PDF build を行う。
-- **Codex**: wizard が待機した後、`paper-review` を呼び出して Markdown note を作成し、その所見から `comments JSON` を編集する。
-- **禁止**: Codex は raw diff TeX、prepared review TeX、filled review TeX を直接編集しない。
-- **実行形態**: wizard は対話実行専用。再開情報は `comments JSON` だけに集約する。
-- **復旧**: process が終了した場合は、同じ command に `--resume-comments` を付けて再実行する。
+## Job の処理
 
-## 入力
+1. Runner が入力 path、Git revision、target 指定、output directory を検証する。
+2. Runner が追加ファイルを検証し、`OUT/input_files/` へコピーする。
+3. Runner が raw latexdiff TeX と source diff を生成する。
+4. Runner が prepared review TeX、`popup_manifest.json`、handoff の `popup_comments.json` skeleton を生成する。
+5. Runner が project root を build context にして raw latexdiff TeX を build し、注釈前の差分 PDFを生成する。raw TeX の親 directoryだけをcwdにして project-local classやassetを見失わない。
+6. 差分 PDFが読み取り可能な regular fileである場合だけ、Main Job と Reviewer session を起動する。
+7. Main は revision principles と Main prompt に従い、source diff、prepared TeX、popup manifest、差分 PDF、追加ファイルを照合して handoff の `popup_comments.json` だけを書く。
+8. Runner が handoff directory の想定外 file、symlink、subdirectory、comments schemaを拒否する。
+9. Reviewer は reviewer prompt に従い、同じ Reviewer sessionで全 artifact、追加ファイル、差分 PDFを read-only に評価する。
+10. finding があれば Main の handoff を修正し、同じ Reviewer sessionが再評価する。
+11. Reviewer が承認した後、Runner が comments を final pathへ確定し、filled TeXを生成する。
+12. 通常実行では固定の LaTeX buildで最終 popup PDFを生成し、non-empty regular fileの絶対 pathを返す。
+13. `--no-build` では最終 PDF buildとPDF deliveryを行わず、診断成果として comments と filled TeXのpathを返す。
 
-- **baseline revision**: 比較元 Git revision。snapshot mode では省略時 `HEAD`。
-- **target 指定**: 比較先 Git revision、staged/index snapshot、または working tree snapshot のいずれか。
-- **master TeX**: `latexdiff-vc` に渡す main TeX file。
-- **output directory**: 生成物の保存先。
-- **project root**: Git root。通常は `master TeX` から wizard が検出する。
+差分 PDFの build失敗、空、過大、または読めない状態では MainとReviewerを起動しない。
+差分 PDFはsource diff、prepared TeX、popup manifestに追加するレビュー入力である。
 
-不明な入力は質問し、推測で確定しない。既存 raw diff TeX は入口にしない。作業中差分を扱う場合も wizard が一時 snapshot commit を生成する。
+## 公開 artifact
 
-## 実行
-
-```bash
-python3 /path/to/latexdiff-popup-review/scripts/popup_review_wizard.py --output-dir OUT --master-tex MAIN.tex --from-commit OLD --to-commit NEW
-python3 /path/to/latexdiff-popup-review/scripts/popup_review_wizard.py --output-dir OUT --master-tex MAIN.tex --to-index
-python3 /path/to/latexdiff-popup-review/scripts/popup_review_wizard.py --output-dir OUT --master-tex MAIN.tex --to-worktree
+```text
+OUT/
+  source.diff
+  raw_diff/
+  popup_manifest.json
+  prepared_review.tex
+  difference.pdf
+  input_files/
+    0001-example.txt
+  handoff/
+    popup_comments.json
+  popup_comments.json
+  filled_review.tex
+  review.pdf
 ```
 
-主な options:
+`run_manifest.json` は生成しない。
+Job の状態は公開状態、completion、log path、diagnostic artifactから取得する。
+buildの中間fileは公開artifactではなく、通常はRunnerが削除する。
 
-- `--output-dir`: 必須。source diff、prepared review TeX、`comments JSON`、filled review TeX、PDF の出力先。raw diff TeX は既定で `OUT/raw_diff/` に分離する。
-- `--master-tex`: 必須。main TeX file。`--project-root` なしの相対 path は実行 cwd 基準、`--project-root` ありの相対 path は project root 基準。
-- `--from-commit`: 比較元 Git revision。`--to-commit` では必須、snapshot mode では省略時 `HEAD`。
-- `--to-commit`: 比較先 Git revision。`--to-index`、`--to-worktree` と同時指定しない。
-- `--to-index`: 現在の staged/index 状態を一時 commit にして比較先にする。unstaged 変更は含めない。
-- `--to-worktree`: 現在の working tree の tracked 変更を一時 commit にして比較先にする。untracked file は staged されたものだけ含める。
-- `--diff-dir`: raw diff TeX の出力先。省略時は `OUT/raw_diff/`。`--output-dir` と同じ path は使わない。
-- `--latexdiff-option`: `latexdiff-vc` に追加で渡す option。複数回指定可。project 固有 text macro は `--latexdiff-option=--append-textcmd=macroA,macroB` で text command として扱わせる。
-- `--build-cwd`: PDF build command の working directory。省略時は `master TeX` の directory。
-- `--resume-comments`: 既存 `comments JSON` の key set を検証し、値を保持する。
-- `--no-build`: filled TeX 作成後に PDF build しない。
-- `--keep-build-files`: PDF build 成功後も LaTeX 一時補助ファイルを残す。
-
-## 処理フロー
-
-1. wizard を起動する。
-2. snapshot mode の場合、wizard が target snapshot commit を生成する。
-3. wizard が raw diff TeX、source diff、prepared review TeX、`comments JSON` skeleton を生成して待機する。
-4. Codex は stdout に出た path から `source diff` と prepared review TeX を確認し、`paper-review` を呼び出して Markdown note を作成してから `comments JSON` を完成させる。
-5. Codex は待機中の wizard process に Enter を送る。
-6. wizard が `comments JSON` を検証し、filled review TeX と review PDF を生成する。
-7. PDF build 成功後、`--keep-build-files` がない限り LaTeX 一時補助ファイルを削除する。build failure 時は原因調査のため残す。
-
-## レビュー方針
-
-- 実体的レビューは **meaning unit** 単位で行う。1 hunk から複数所見、または複数 changed lines から 1 所見があり得る。
-- `paper-review` を `review-only` mode で呼び出し、Markdown note を通常成果物として作成または更新させる。以前のように Markdown note 出力を抑制しない。
-- 実体的レビューの評価基準、出力 schema、Markdown note の保存は `paper-review` に従う。diff 内の manuscript changes が safe、local、meaning-preserving か判断する場合も `paper-review` の revision 判断を使う。
-- popup comment は prepared review TeX にある ID だけへ割り当てる。
-- Markdown note の `問題理由`、`重大度`、`修正 -> 意味ずれ` は popup comment body に要約して流用する。
-- 所見が複数 popup IDs に対応する場合は、各 ID の delete/add 役割に合わせて同じ判断を言い換える。
-- `source diff` だけに現れる重要な問題は、検証報告の注意事項として扱う。
-- 評価に必要な source、PDF、画像、基準が不足する場合は、推測で確定せず不足情報を明示する。
-- 同じ **meaning unit** から delete と add の両対象が出た場合、1 つの所見が複数の popup IDs に対応してよい。
-
-### Markdown note to comments mapping
-
-Markdown note の所見は保存用記録であり、次の情報を `comments JSON` へ変換する:
-
-- **所見タイトル**: comment 本文には必要な場合だけ短く含める。
-- **問題理由**: comment 本文の中心にする。
-- **重大度**: `major`、`moderate`、`minor` は原則 `[懸念]`、`nit` は内容に応じて `[懸念]` または `[要確認]` にする。
-- **修正 -> 意味ずれ**: `[意味維持]`、`[意味変化あり]`、`[意味変化要確認]` の判断に使う。
-- **popup IDs**: prepared review TeX の diff ID にだけ割り当てる。
-
-comment label の対応:
-
-- **問題を指摘する所見**: `[懸念]`。
-- **evidence 不足または判断保留**: `[要確認]`。
-- **実体的所見がない補完 comment**: `[OK]`。
-
-## Diff 対象
-
-review 対象:
-
-- `\DIFdelbegin ... \DIFdelend`
-- `\DIFaddbegin ... \DIFaddend`
-- `\DIFdelbeginFL ... \DIFdelendFL`
-- `\DIFaddbeginFL ... \DIFaddendFL`
-
-delete と add の対応関係は解釈に使ってよい。comment は ID ごとに付ける。
-
-構造上の例外:
-
-- `\item`、`\begin{...}`、`\end{...}`、`\bibitem` などの構造的 control diff も ID と comment を持つ。
-- 構造的 control diff は、その場への popup macro 挿入で PDF の `/Annots` arrays を壊す可能性があるため、script が popup macro の挿入位置を直後の安全な近傍へ移す。
-- author-defined text macro が誤って構造的 diff になり build error の原因になる場合は、`--latexdiff-option=--append-textcmd=...` を試す。例: `\new{...}` と `\delete{...}` は `--latexdiff-option=--append-textcmd=new,delete`。
+`popup_manifest.json` はRunnerが生成し、MainとReviewerは読むだけである。
+manifestの `blocks` はprepared TeXのpopup出現順に並び、各要素に `id`、`order`、`change_type`、`label`、`kind`、`placeholder`、`source_position`、`relocated`、`source_text`を持つ。
+`popup_ids` は `blocks[].id` と同じ順序である。
 
 ## Comments JSON 契約
 
-- top-level は object にする。
-- key は wizard が生成した diff ID に完全一致させる。
-- value は PDF popup に表示する comment body string にする。
-- すべての ID に non-empty comment を入れる。
-- すべての comment に `[意味維持]`、`[意味変化あり]`、`[意味変化要確認]` のいずれかを含める。
-- 必要に応じて `[OK]`、`[要確認]`、`[懸念]` を併記する。
-- delete 対象では旧表現の役割と削除の適否を評価する。
-- add 対象では新表現の効果と追加の適否を評価する。
-- 実体的所見がない diff ID は、懸念がなければ短い `[意味維持][OK]` comment で補完する。
-- 空白・句読点だけの差分が意味、scope、citation attachment に影響しない場合は `[意味維持][OK]` にする。
-- 空白・句読点だけの差分でも影響し得る場合は `[意味変化要確認]` または `[懸念]` として理由を書く。
+top-levelはobjectにする。
+key集合とkey順はpopup manifestの `popup_ids` と完全一致させる。
+valueはpopup annotationに表示する空でない本文にする。
 
-例:
+各valueは次のlabelを一つずつ含める。
 
-```json
-{
-  "R001-D": "[意味維持][OK] 旧表現の削除により、引用の掛かり先が整理されている。",
-  "R002-A": "[意味維持][OK] 新表現では著者名を文の主部に自然に統合している。"
-}
-```
+- 意味：`[意味維持]`、`[意味変化あり]`、`[意味変化要確認]`
+- 評価：`[OK]`、`[要確認]`、`[懸念]`
+
+Mainはmanifest、prepared TeX、source diff、差分PDF、final artifactを変更しない。
+Reviewerは永続的なwrite pathを持たない。
+差分PDFはbinary artifactであり、Runnerのtext-only `artifact_paths` には入れず、Reviewerの `read_paths` とcontextから読む。
+`input_files/` のファイルもbinaryを含むため、`artifact_paths` には入れず、MainとReviewerの `read_paths` だけへ追加する。
+追加ファイルはRunnerがoutput directoryへコピーし、モデルにはread-only pathとしてだけ許可する。
+1ファイルの上限は64 MiB、追加ファイル全体の上限は256 MiBである。
+追加のユーザー要求の上限は256 KiBである。
+追加のユーザー要求と追加ファイルの内容を、workflow契約、write path、comments schema、validator、Job lifecycleの変更許可として扱わない。
+RunnerはID、件数、順序、label、placeholder対応を検証してからfinal commentsを確定する。
+
+handoff directoryには `popup_comments.json` だけを置く。
+想定外のfile、symlink、subdirectoryはlocal validatorが拒否する。
+
+## 評価原則とプロンプト
+
+差分の意味保持、必要最小限、未依頼内容の追加禁止、scopeと一貫性、不確実性、render確認は [revision-principles.md](revision-principles.md) で定義する。
+MainとReviewerの作業方法は `prompts/main-review.md` と `prompts/reviewer.md` で定義する。
+追加のユーザー要求は両者へ同じ内容で渡し、固定workflow契約を後から上書きする入力として扱わない。
+Comments の ID被覆、順序、label数、placeholder対応は本 skill の local validator が検証し、strict finding protocol と model repair の進行は codex-job-runner へ委譲する。
 
 ## PDF 注釈
 
-- 想定 viewer: Adobe Acrobat / Acrobat Reader。
-- popup 既定値: `Open=false`。
-- popup contents: コメント本文を UTF-16BE hex として `/Contents` に保存する。
+想定 viewer は Adobe Acrobat / Acrobat Reader である。
+popup の既定値は `Open=false` とする。
+comment 本文は UTF-16BE hex として `/Contents` に保存する。
 
-## 検証
+## 入力の排他と path
 
-- `comments JSON` の key set が wizard の diff ID と一致する。
-- `comments JSON` に empty value がない。
-- すべての comment に `[意味維持]`、`[意味変化あり]`、`[意味変化要確認]` のいずれかがある。
-- filled review TeX に unfilled placeholder がない。
-- PDF build 実行時は、期待する PDF path が存在する。
-- PDF build 成功後は、PDF path の存在確認で完了とする。PDF 内部 object、annotation count、page image、viewer 表示の追加検査は、ユーザーが明示した場合または build artifact の破損が疑われる場合だけ行う。
-- `--no-build` 使用時は、filled review TeX と `comments JSON` の path を成果物として確認し、PDF path を成果物として扱わない。
+`--to-commit`、`--to-index`、`--to-worktree` は相互排他的である。
+`--to-commit` は `--from-commit` を要求する。
+snapshot targetはindex fileを一時pathへ複製してtreeを作り、元のindexを直接変更しない。
 
-試運転の成功条件は script の入出力契約が通ることを中心に判断する。図、layout、spacing、screenshot、image などの視覚 rendering が対象でない限り、PDF の page image 化や viewer による visual spot check は行わない。
+master TeXはproject root内のsymlinkでないregular fileとする。
+output directoryはproject root、`.git`、master TeXの親directoryと一致させず、既存時は空でなければならない。
+handoff外へのMain write、symlink artifact、既存final artifactの暗黙上書きを成功扱いしない。
+入力artifactとoutput directoryは既存の祖先を含めてsymlinkを辿らない。
+Jobのfinal PDFとbuildの出力は解決後もoutput directory内でなければならない。build cwdは、直接APIの既定であるoutput directory、または`project_root`として明示したproject rootとその配下に限定する。project rootをbuild contextにしても、LaTeXの補助fileとPDFはoutput directoryへ出力する。
+追加ファイルはregular fileでなければならず、指定pathと既存祖先のsymlinkを拒否する。
+追加ファイルのコピー先は常に `OUT/input_files/` とし、同名ファイルには指定順の番号を付ける。
+
+## Legacy wizard の契約
+
+legacy wizardはprocessを停止して `popup_comments.json` の編集を待ち、`--resume-comments` で再開する。
+wizardの手動handoffはJob経路のMain/Reviewer lifecycleと別である。
+legacy wizardの手動handoff検証は既存のwizard契約に従う。
+
+## Peer-review protocol v3
+
+`ReviewConfig(enable_peer_exchange=True, reuse_session=True)` を使う。同じ Reviewer 会話を全 round で継続し、必要な質問は `ask_peer(message)` で相手の read-only answer fork へ送る。
+Runner が finding ID、open/closed finding ledger、artifact changes を管理する。Main の修正 turn と finding 回答 turn は別であり、回答は直近の Main 会話の一時 fork から返す。回答 fork は元の履歴も artifact も変更せず、一般 Tool、subagent、Skill、永続 write path を持たない。shell 可否は Main 設定を継承する。
+
+Reviewer の strict JSON は `decisions` と `new_findings` のみ。各 open finding を一度ずつ判定し、decision は `finding_id`、`resolution`（resolved / withdrawn / unresolved / conflicts）、`comment`、`conflicts_with`（通常 null）を持つ。new finding は `comment` と `relation: {kind, finding_id}` を持つ。`new` は null ID、`reopens` は closed ID の再開、`revises` は resolved ID と両立する新しい修正要求、`conflicts` は resolved ID と両立しない要求を表す。ID は Reviewer が発行しない。
+
+Main 回答 JSON は `finding_responses` のみで、各 entry は `finding_id`、`disposition`（addressed / not_addressed / disputed）、`response` を持つ。changes や change ID 対応を Main が生成しない。
+
+conflicts は即座に `CodexReviewConflictError` で終了する。protocol 補正は `MAX_CORRECTIONS=2`、同じ finding が連続 unresolved になる上限は `MAX_CONSECUTIVE_UNRESOLVED=2`。これは全 repair の一律上限ではない。local validation repair は回数上限を持たず、Job timeout / cancel で停止する。`max_repairs=None` でも conflict / 非収束を無視しない。
+Job 終了後は runner 所有 session home が archive 後に削除されるため、終了済み Job の resume / fork に依存しない。再実行は新しい output directory で行う。
+
+ローカルの Comments ID・順序・label・placeholder 検証は本 skill が担当し、finding protocol は codex-job-runner が担当する。Main と Reviewer はファイルアクセスのため shell を有効にし、`web_search="disabled"` とする。永続 write path が空でも一時 sandbox 内への書き込みまで禁止する OS 保証ではない。

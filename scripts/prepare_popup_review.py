@@ -81,6 +81,29 @@ UNSAFE_TOKENS = (
     r"\bibitem",
 )
 
+# TeX arguments to these commands are written to auxiliary files and are
+# therefore ``moving arguments``.  The popup macro uses boxes and a PDF
+# annotation primitive; leaving it in one of these arguments makes LaTeX fail
+# (and, for captions/section headings, can also poison the table of contents).
+# Keep this list deliberately conservative: a false positive merely moves an
+# annotation to the end of an argument, while a false negative breaks a build.
+MOVING_ARGUMENT_COMMANDS = frozenset(
+    {
+        "caption",
+        "captionof",
+        "chapter",
+        "section",
+        "subsection",
+        "subsubsection",
+        "paragraph",
+        "subparagraph",
+        "part",
+        "title",
+        "author",
+        "thanks",
+    }
+)
+
 PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 
@@ -92,6 +115,25 @@ class DiffBlock:
     line: int
     block: str
     relocated: bool = False
+
+    @property
+    def change_type(self) -> str:
+        """Return the public manifest change type for this diff block."""
+        return "delete" if self.kind == "del" else "add"
+
+    def to_manifest_entry(self, order: int) -> dict[str, object]:
+        """Serialize deterministic source-to-popup correspondence metadata."""
+        return {
+            "id": self.id,
+            "order": order,
+            "change_type": self.change_type,
+            "label": self.change_type,
+            "kind": self.kind,
+            "placeholder": self.placeholder,
+            "source_position": {"line": self.line, "column": 1},
+            "relocated": self.relocated,
+            "source_text": self.block,
+        }
 
 
 def is_safe_popup_target(block: str) -> bool:
@@ -111,6 +153,11 @@ def parse_args() -> argparse.Namespace:
         "--comments-json",
         type=Path,
         help="JSON skeleton path。default は OUTPUT stem + _comments.json。",
+    )
+    p.add_argument(
+        "--popup-manifest",
+        type=Path,
+        help="popup IDとsource位置のmanifest path。指定時だけ生成する。",
     )
     p.add_argument(
         "--prefix",
@@ -187,6 +234,137 @@ def split_document_end(body: str) -> tuple[str, str]:
     return head, sep + tail
 
 
+def _skip_tex_space(tex: str, position: int) -> int:
+    """Skip whitespace and comments while parsing a command argument."""
+    length = len(tex)
+    while position < length:
+        if tex[position].isspace():
+            position += 1
+            continue
+        if tex[position] == "%":
+            newline = tex.find("\n", position)
+            position = length if newline < 0 else newline + 1
+            continue
+        break
+    return position
+
+
+def _balanced_delimiter_end(tex: str, opening: int, left: str, right: str) -> int | None:
+    """Return the exclusive end of a balanced TeX delimiter, or ``None``."""
+    if opening >= len(tex) or tex[opening] != left:
+        return None
+    depth = 1
+    nested_braces = 0
+    position = opening + 1
+    while position < len(tex):
+        char = tex[position]
+        if char == "%":
+            newline = tex.find("\n", position)
+            position = len(tex) if newline < 0 else newline + 1
+            continue
+        if char == "\\":
+            # Escaped braces/brackets are text, not delimiters.  A control
+            # symbol consumes the following character; a control word is
+            # consumed as one token as well.
+            position += 1
+            if position < len(tex) and tex[position].isalpha():
+                while position < len(tex) and tex[position].isalpha():
+                    position += 1
+            elif position < len(tex):
+                position += 1
+            continue
+        if left == "[":
+            # Optional moving arguments may contain nested groups with a
+            # literal closing bracket.  Treat those brackets as text.
+            if char == "{":
+                nested_braces += 1
+            elif char == "}" and nested_braces:
+                nested_braces -= 1
+            elif not nested_braces and char == left:
+                depth += 1
+            elif not nested_braces and char == right:
+                depth -= 1
+                if depth == 0:
+                    return position + 1
+        elif char == left:
+            depth += 1
+        elif char == right:
+            depth -= 1
+            if depth == 0:
+                return position + 1
+        position += 1
+    return None
+
+
+def moving_argument_regions(tex: str) -> tuple[tuple[int, int], ...]:
+    """Find moving-argument spans as ``(content_start, end)``.
+
+    The scanner handles starred commands, optional short arguments, nested
+    braces, escaped delimiters, and comments.  Unknown/malformed commands are
+    ignored so preparation can still provide diagnostics for the original
+    latexdiff artifact.
+    """
+    regions: list[tuple[int, int]] = []
+    position = 0
+    length = len(tex)
+    while position < length:
+        if tex[position] == "%":
+            newline = tex.find("\n", position)
+            position = length if newline < 0 else newline + 1
+            continue
+        if tex[position] != "\\":
+            position += 1
+            continue
+        command_start = position
+        position += 1
+        if position >= length or not (tex[position].isalpha() or tex[position] == "@"):
+            position += 1
+            continue
+        name_start = position
+        while position < length and (tex[position].isalpha() or tex[position] == "@"):
+            position += 1
+        command = tex[name_start:position]
+        if command not in MOVING_ARGUMENT_COMMANDS:
+            continue
+        if position < length and tex[position] == "*":
+            position += 1
+        position = _skip_tex_space(tex, position)
+        optional_start: int | None = None
+        if position < length and tex[position] == "[":
+            optional_start = position
+            optional_end = _balanced_delimiter_end(tex, position, "[", "]")
+            if optional_end is None:
+                continue
+            position = _skip_tex_space(tex, optional_end)
+        if position >= length or tex[position] != "{":
+            if optional_start is not None:
+                # Keep a malformed command's optional argument protected even
+                # when no mandatory argument follows it.
+                regions.append((optional_start + 1, position))
+            continue
+        argument_end = _balanced_delimiter_end(tex, position, "{", "}")
+        if argument_end is None:
+            continue
+        if optional_start is not None:
+            # A popup in the short/optional argument must be emitted after the
+            # mandatory argument too; placing it between ``[...]`` and ``{}``
+            # would make the command consume the popup macro as its argument.
+            regions.append((optional_start + 1, argument_end))
+        regions.append((position + 1, argument_end))
+        # Continue scanning after the command name.  Nested moving commands
+        # inside this argument are discovered by the normal scan and are
+        # handled conservatively by choosing the outermost enclosing region at
+        # injection time.
+        position = command_start + 1
+    return tuple(regions)
+
+
+def moving_argument_end(position: int, regions: tuple[tuple[int, int], ...]) -> int | None:
+    """Return the end of the outermost moving argument containing position."""
+    containing = [end for start, end in regions if start <= position < end]
+    return max(containing) if containing else None
+
+
 def flush_pending(out: list[str], pending_macros: list[str]) -> None:
     if not pending_macros:
         return
@@ -195,37 +373,57 @@ def flush_pending(out: list[str], pending_macros: list[str]) -> None:
 
 
 def insert_placeholders(body: str, prefix: str, line_offset: int) -> tuple[str, list[DiffBlock], list[int]]:
-    out: list[str] = []
     blocks: list[DiffBlock] = []
     relocated_lines: list[int] = []
-    pending_macros: list[str] = []
-    cursor = 0
-    index = 0
     body_without_end, document_end = split_document_end(body)
+    regions = moving_argument_regions(body_without_end)
+    matches = tuple(BLOCK_RE.finditer(body_without_end))
 
-    for match in BLOCK_RE.finditer(body_without_end):
-        gap = body_without_end[cursor : match.start()]
-        out.append(gap)
-        if pending_macros and gap.strip():
-            flush_pending(out, pending_macros)
+    # Build insertion events against offsets in the original body.  Keeping
+    # the source offsets separate from the rewritten text lets us place a
+    # popup after a complete ``\\caption{...}``/``\\section{...}`` argument,
+    # including when the diff block itself contains structural tokens.
+    events: dict[int, list[tuple[int, str]]] = {}
+    for index, match in enumerate(matches, 1):
         block = match.group("block")
         kind = match.group("kind_fl") or match.group("kind_std")
         line = line_offset + body_without_end.count("\n", 0, match.start())
-        out.append(block)
-        cursor = match.end()
-
-        index += 1
         diff_id = build_id(prefix, index, kind)
         placeholder = placeholder_for(diff_id)
-        relocated = not is_safe_popup_target(block)
+        moving_end = moving_argument_end(match.start(), regions)
+        relocated = moving_end is not None or not is_safe_popup_target(block)
         macro = popup_macro(diff_id, placeholder)
-        if relocated:
-            pending_macros.append(macro)
-            relocated_lines.append(line)
+
+        if moving_end is not None:
+            # Structural relocation is preferred to dropping an ID.  The
+            # event is after the enclosing argument's closing brace, so the
+            # popup primitive never appears in a moving argument.
+            insertion = moving_end
+        elif not is_safe_popup_target(block):
+            # Preserve the legacy "pending until a meaningful safe boundary"
+            # behavior for structural blocks outside moving arguments.
+            next_match = matches[index] if index < len(matches) else None
+            next_start = next_match.start() if next_match is not None else len(body_without_end)
+            gap = body_without_end[match.end() : next_start]
+            # With whitespace-only separation the old pending queue flushed
+            # after the next block and before that block's own safe popup.  Use
+            # the same anchor so manifest/source order remains popup order.
+            insertion = (
+                next_start
+                if gap.strip() or next_match is None
+                else next_match.end()
+            )
+            # A pending structural macro must not accidentally be flushed
+            # inside a later moving argument.
+            enclosing_end = moving_argument_end(insertion, regions)
+            if enclosing_end is not None:
+                insertion = enclosing_end
         else:
-            if pending_macros:
-                flush_pending(out, pending_macros)
-            out.append(macro)
+            insertion = match.end()
+
+        events.setdefault(insertion, []).append((index, macro))
+        if relocated:
+            relocated_lines.append(line)
         blocks.append(
             DiffBlock(
                 id=diff_id,
@@ -237,10 +435,20 @@ def insert_placeholders(body: str, prefix: str, line_offset: int) -> tuple[str, 
             )
         )
 
-    tail = body_without_end[cursor:]
-    out.append(tail)
-    if pending_macros:
-        flush_pending(out, pending_macros)
+    out: list[str] = []
+    cursor = 0
+    for event_position in sorted(events):
+        position = event_position
+        event_list = events[event_position]
+        if position < cursor:
+            # This can only arise from malformed overlapping regions.  Keep
+            # the source text intact and emit the event at the current cursor,
+            # which remains outside any already-consumed argument.
+            position = cursor
+        out.append(body_without_end[cursor:position])
+        out.extend(macro for _index, macro in sorted(event_list, key=lambda item: item[0]))
+        cursor = position
+    out.append(body_without_end[cursor:])
     out.append(document_end)
     return "".join(out), blocks, relocated_lines
 
@@ -289,16 +497,40 @@ def write_comments_json(path: Path, blocks: list[DiffBlock]) -> None:
     write_json_atomic(path, payload)
 
 
+def popup_manifest_payload(blocks: list[DiffBlock]) -> dict[str, object]:
+    """Build the deterministic popup manifest consumed by the Job workflow."""
+    entries = [block.to_manifest_entry(index) for index, block in enumerate(blocks, 1)]
+    return {
+        "schema_version": 1,
+        "popup_ids": [entry["id"] for entry in entries],
+        "blocks": entries,
+    }
+
+
+def write_popup_manifest(path: Path, blocks: list[DiffBlock]) -> None:
+    """Write a popup manifest without allowing an existing artifact to be replaced."""
+    if path.exists():
+        raise ValueError(f"popup manifest already exists; refusing overwrite: {path}")
+    write_text_atomic(
+        path,
+        json.dumps(popup_manifest_payload(blocks), ensure_ascii=False, indent=2) + "\n",
+    )
+
+
 def main() -> int:
     args = parse_args()
     input_tex = args.input_tex.resolve()
     output_tex = (args.output_tex or default_output_path(input_tex)).resolve()
     comments_json = (args.comments_json or default_comments_path(output_tex)).resolve()
-    ensure_distinct_paths(
+    popup_manifest = args.popup_manifest.resolve() if args.popup_manifest else None
+    named_paths = [
         ("raw diff TeX", input_tex),
         ("prepared review TeX", output_tex),
         ("comments JSON", comments_json),
-    )
+    ]
+    if popup_manifest is not None:
+        named_paths.append(("popup manifest", popup_manifest))
+    ensure_distinct_paths(*named_paths)
     validate_prefix(args.prefix)
 
     tex = input_tex.read_text(encoding="utf-8")
@@ -325,9 +557,13 @@ def main() -> int:
     write_text_atomic(output_tex, prepared_tex)
     if not args.resume_comments:
         write_comments_json(comments_json, blocks)
+    if popup_manifest is not None:
+        write_popup_manifest(popup_manifest, blocks)
 
     print(f"prepared_tex: {output_tex}")
     print(f"comments_json: {comments_json}")
+    if popup_manifest is not None:
+        print(f"popup_manifest: {popup_manifest}")
     print(f"diff_blocks: {len(blocks)}")
     print(f"relocated_structural_blocks: {len(relocated_lines)}")
     if relocated_lines:

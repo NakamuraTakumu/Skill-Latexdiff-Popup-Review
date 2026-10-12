@@ -1,0 +1,7 @@
+interface:
+  display_name: "Latexdiff popup review"
+  short_description: "差分PDFとpopup注釈付きレビューPDFを作る"
+  default_prompt: "Use $latexdiff-popup-review with the sibling codex-job-runner (peer-review protocol v3) to review a Git-managed LaTeX diff and create a popup-annotated PDF via scripts/run_popup_review.py. Do not edit the manuscript."
+
+policy:
+  allow_implicit_invocation: true

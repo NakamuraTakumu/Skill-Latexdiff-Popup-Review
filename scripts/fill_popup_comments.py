@@ -32,7 +32,10 @@ import re
 import sys
 from pathlib import Path
 
-from prepare_popup_review import write_text_atomic
+try:
+    from .prepare_popup_review import write_text_atomic
+except ImportError:  # Direct script execution from the scripts directory.
+    from prepare_popup_review import write_text_atomic
 
 
 PLACEHOLDER_RE = re.compile(r"__COMMENT_[A-Za-z0-9_]+__")

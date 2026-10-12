@@ -24,6 +24,8 @@ venv/
 tmp/
 tmp_*/
 tmp_pdf/
-document/
+# Public documentation is versioned; local runtime logs are not.
+.codex-job-runner-logs/
+.codex-task-reports/
 *.tmp
 *.log
